@@ -28,6 +28,7 @@ packages = [
     "python/proctor_protocol",
     "python/proctor_fusion",
     "python/proctor_gateway",
+    "python/proctor_identity",
     "python/proctor_sim",
 ]
 

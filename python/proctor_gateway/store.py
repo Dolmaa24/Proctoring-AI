@@ -76,6 +76,38 @@ CREATE TABLE IF NOT EXISTS violations (
     evidence      TEXT NOT NULL
 );
 
+-- Face templates. Deliberately a separate table from the scores derived
+-- from them, so the two can be expired on different clocks: an embedding
+-- is a biometric template with no review value once the exam is over,
+-- while "similarity was 0.41 at 10:32" is exactly what a reviewer needs
+-- and carries far less risk if it leaks.
+CREATE TABLE IF NOT EXISTS identity_templates (
+    session_id  TEXT PRIMARY KEY,
+    embedder    TEXT NOT NULL,
+    dimensions  INTEGER NOT NULL,
+    reference   TEXT NOT NULL,
+    captures    INTEGER NOT NULL,
+    min_pairwise REAL NOT NULL,
+    created_ms  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS identity_checks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    outcome       TEXT NOT NULL,
+    similarity    REAL,
+    threshold     REAL NOT NULL,
+    calibrated_on TEXT NOT NULL,
+    issues        TEXT NOT NULL,
+    recorded_ms   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS templates_by_age
+    ON identity_templates (created_ms);
+CREATE INDEX IF NOT EXISTS checks_by_session
+    ON identity_checks (session_id, recorded_ms);
+CREATE INDEX IF NOT EXISTS checks_by_age
+    ON identity_checks (recorded_ms);
 CREATE INDEX IF NOT EXISTS violations_by_session
     ON violations (session_id, recorded_ms);
 CREATE INDEX IF NOT EXISTS violations_by_age
@@ -116,6 +148,21 @@ class Store(Protocol):
     def append_violation(self, violation: dict[str, Any], now_ms: int) -> None: ...
     def load_violations(self, per_session: int) -> dict[str, list[dict[str, Any]]]: ...
     def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]: ...
+    def save_template(
+        self,
+        session_id: str,
+        embedder: str,
+        reference: tuple[float, ...],
+        captures: int,
+        min_pairwise: float,
+        now_ms: int,
+    ) -> None: ...
+    def load_templates(self) -> dict[str, dict[str, Any]]: ...
+    def append_identity_check(
+        self, session_id: str, result: dict[str, Any], now_ms: int
+    ) -> None: ...
+    def load_identity_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]: ...
+    def purge_templates_older_than(self, cutoff_ms: int) -> int: ...
     def close(self) -> None: ...
 
 
@@ -141,6 +188,29 @@ class MemoryStore:
 
     def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]:
         return (0, 0)
+
+    def save_template(
+        self,
+        session_id: str,
+        embedder: str,
+        reference: tuple[float, ...],
+        captures: int,
+        min_pairwise: float,
+        now_ms: int,
+    ) -> None:
+        return None
+
+    def load_templates(self) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def append_identity_check(self, session_id: str, result: dict[str, Any], now_ms: int) -> None:
+        return None
+
+    def load_identity_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        return []
+
+    def purge_templates_older_than(self, cutoff_ms: int) -> int:
+        return 0
 
     def close(self) -> None:
         return None
@@ -312,6 +382,117 @@ class SqliteStore:
 
     # -- retention ---------------------------------------------------------
 
+    # -- identity ----------------------------------------------------------
+
+    def save_template(
+        self,
+        session_id: str,
+        embedder: str,
+        reference: tuple[float, ...],
+        captures: int,
+        min_pairwise: float,
+        now_ms: int,
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO identity_templates (
+                    session_id, embedder, dimensions, reference, captures,
+                    min_pairwise, created_ms
+                ) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    embedder     = excluded.embedder,
+                    dimensions   = excluded.dimensions,
+                    reference    = excluded.reference,
+                    captures     = excluded.captures,
+                    min_pairwise = excluded.min_pairwise,
+                    created_ms   = excluded.created_ms
+                """,
+                (
+                    session_id,
+                    embedder,
+                    len(reference),
+                    json.dumps(list(reference)),
+                    captures,
+                    min_pairwise,
+                    now_ms,
+                ),
+            )
+            self._db.commit()
+
+    def load_templates(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM identity_templates").fetchall()
+        return {
+            row["session_id"]: {
+                "embedder": row["embedder"],
+                "reference": tuple(json.loads(row["reference"])),
+                "captures": row["captures"],
+                "min_pairwise": row["min_pairwise"],
+            }
+            for row in rows
+        }
+
+    def append_identity_check(self, session_id: str, result: dict[str, Any], now_ms: int) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO identity_checks (
+                    session_id, outcome, similarity, threshold, calibrated_on,
+                    issues, recorded_ms
+                ) VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    session_id,
+                    result["outcome"],
+                    result["similarity"],
+                    result["threshold"],
+                    result["calibrated_on"],
+                    json.dumps(result.get("issues", [])),
+                    now_ms,
+                ),
+            )
+            self._db.commit()
+
+    def load_identity_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT * FROM identity_checks WHERE session_id = ?
+                ORDER BY recorded_ms DESC, id DESC LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [
+            {
+                "outcome": row["outcome"],
+                "similarity": row["similarity"],
+                "threshold": row["threshold"],
+                "calibrated_on": row["calibrated_on"],
+                "issues": json.loads(row["issues"]),
+                "recorded_ms": row["recorded_ms"],
+            }
+            for row in rows
+        ]
+
+    def purge_templates_older_than(self, cutoff_ms: int) -> int:
+        """Expire face templates on their own, shorter clock.
+
+        A template has no review value once the exam is over — a reviewer
+        compares recordings, not vectors — but it is the highest-risk row
+        in the database. The similarity scores derived from it survive on
+        the longer retention clock, so the audit trail stays intact after
+        the biometric itself is gone.
+        """
+        with self._lock:
+            removed = self._db.execute(
+                "DELETE FROM identity_templates WHERE created_ms < ?", (cutoff_ms,)
+            ).rowcount
+            self._db.commit()
+        return max(0, removed)
+
+    # -- retention ---------------------------------------------------------
+
     def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]:
         """Delete data older than the cutoff. Returns (violations, sessions).
 
@@ -324,6 +505,7 @@ class SqliteStore:
             violations = self._db.execute(
                 "DELETE FROM violations WHERE recorded_ms < ?", (cutoff_ms,)
             ).rowcount
+            self._db.execute("DELETE FROM identity_checks WHERE recorded_ms < ?", (cutoff_ms,))
             sessions = self._db.execute(
                 "DELETE FROM sessions WHERE updated_ms < ?", (cutoff_ms,)
             ).rowcount

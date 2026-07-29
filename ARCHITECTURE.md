@@ -18,6 +18,7 @@ python/
   proctor_protocol/   wire format: event schema, signing, key derivation
   proctor_fusion/     policy evaluation, temporal filtering  (no I/O)
   proctor_gateway/    FastAPI: ingest, integrity checks, proctor fan-out
+  proctor_identity/   enrolment, face matching, temporal decision (no I/O)
   proctor_sim/        headless candidates, honest and hostile
   tests/              behavioural + adversarial + conformance suites
 apps/client/src/
@@ -32,8 +33,8 @@ tools/
   conformance.ts            TS-signed frames for the Python verifier
 ```
 
-Planned, not yet built: `services/identity` (ArcFace),
-`services/audio` (VAD → STT → intent), `services/media` (SFU + recording).
+Planned, not yet built: `services/audio` (VAD → STT → intent),
+`services/media` (SFU + recording).
 
 ### 1.1 Why the schema is generated
 
@@ -292,6 +293,89 @@ and that secret unset, a restart restores the sessions but derives
 signature check and the candidate is flagged for something the server did.
 The startup warning says this explicitly when both conditions hold.
 
+## 5.4 Identity verification
+
+`python/proctor_identity/`. Enrolment builds a reference template from
+several captures; periodic probes are compared by cosine similarity;
+sustained disagreement is reported as an ordinary flag.
+
+This is the most consequential thing the platform can say about a person —
+that someone else sat their exam — and it is said by the component with
+the largest documented accuracy gap. NIST's FRVT 1:1 evaluations found
+false-match rates varying by one to two orders of magnitude across
+demographic groups, highest for West and East African and East Asian
+faces, for women, and at the extremes of age. Four consequences are built
+into the code rather than written down and forgotten:
+
+**There is no default threshold.** `MatchPolicy` requires one, and
+`Threshold.calibrated_on` requires a record of what population it was
+measured against. Identity verification stays disabled until both
+`PROCTOR_IDENTITY_THRESHOLD` and `PROCTOR_IDENTITY_CALIBRATED_ON` are set.
+A cutoff with no provenance is a guess wearing a number.
+
+**Unusable captures are `NOT_ASSESSABLE`, never `MISMATCH`.** A dark room,
+a turned head, a distant face — none of these produce a similarity score
+at all, because a number computed from an unusable frame reflects the
+lighting rather than the person and would then sit in someone's audit
+trail looking like evidence. Being hard to photograph is not evidence of
+impersonation, and conflating the two is precisely how a system ends up
+failing hardest the people its models were already worst at.
+
+**One low frame is never enough.** Three of the last five assessable
+probes must disagree, and `VerificationPolicy` refuses to be configured
+below two. A long run of unassessable probes reports separately as
+`UNOBSERVABLE` — "we cannot see", not "it is someone else".
+
+**Findings carry their own caveat and their own numbers.** The evidence is
+the similarities and the threshold applied, and the message shown to a
+proctor states the demographic accuracy caveat inline. A reviewer sees
+`0.41 against 0.55 (calibrated: …)`, not the word "mismatch".
+
+Identity reuses the ordinary violation record rather than a parallel
+channel, so it inherits `action: flag` and `requires_human_review: true`
+like every other rule. Nothing here ends an exam.
+
+### 5.4.1 Why embedding happens server-side
+
+The client could embed locally and send only a vector, which keeps face
+images off the network. That is the better privacy answer and the wrong
+security answer: a client that computes its own identity evidence can
+resend the enrolment vector forever and the check becomes decorative.
+
+So the image crosses the wire and the server embeds it. The compensating
+controls are that **no face image is ever written to disk** — handlers
+embed and discard — and that templates expire on their own much shorter
+clock (`PROCTOR_TEMPLATE_RETENTION_DAYS`, default 1) than the similarity
+scores derived from them. A template has no review value once the exam is
+over; a human compares recordings, not vectors. The audit trail therefore
+outlives the biometric.
+
+Templates embedded by a different model are dropped on restore rather than
+reused: comparing vectors across networks yields a meaningless similarity,
+and a meaningless similarity that crosses a threshold is an accusation.
+
+### 5.4.2 Model licensing — read before choosing weights
+
+**No face model is bundled, deliberately.** Most readily available
+ArcFace weights, including the entire InsightFace model zoo, are released
+for **non-commercial research use only**. Shipping one would hand every
+downstream user a licence violation — the same shape of problem as
+Ultralytics' AGPL licence (§7).
+
+`PROCTOR_FACE_MODEL` points at your own licensed ONNX export. Without one,
+the deterministic test double is used; it is not a face model and never
+claims to be, and exists so that this project's own logic can be tested
+without a licensed model or a photograph of a real person.
+
+### 5.4.3 Out of scope: ID document capture
+
+The blueprint this was built from also called for scanning a government
+ID. That is not implemented and is not a small addition: it introduces
+name, date of birth, address and document number into a service that
+currently holds only an opaque `candidate_ref`, and it carries its own
+retention, accuracy and discrimination questions. It should be scoped
+separately rather than folded in.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -328,7 +412,8 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 ## 8. Status
 
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
-client, proctor console, persistence (98 Python + 29 TypeScript tests). The full chain has been run
+client, proctor console, persistence, identity verification
+(157 Python + 29 TypeScript tests). The full chain has been run
 end-to-end against a synthetic camera feed in both the face-present and
 no-face cases; see `apps/client/scripts/e2e.mjs`.
 
@@ -343,7 +428,7 @@ thought of. Matching is now by exact basename with OS-vendor paths
 excluded, and a test runs against the real process table of whatever
 machine it is on.
 
-Not built: SFU and recording, identity verification, audio pipeline.
+Not built: SFU and recording, audio pipeline, ID document capture (§5.4.3).
 The proctor stream is now
 token-authenticated and fails closed, but there is still no per-proctor
 identity, no audit of who looked at whom, and no TLS termination here —

@@ -7,8 +7,7 @@ and evidence. Raw video never touches the telemetry path.
 Rebuilt from scratch. The original OpenCV desktop scripts are preserved on
 the `upstream/master` remote for reference.
 
-> **Not production ready.** No identity verification, no session
-> recording. See ARCHITECTURE.md § 8 for the full list, and § 3.2
+> **Not production ready.** No session recording, no audio pipeline. See ARCHITECTURE.md § 8 for the full list, and § 3.2
 > for a documented, unclosed gap in clock-stretch detection.
 
 ---
@@ -67,6 +66,7 @@ Drive a simulated candidate against it:
 | `apps/client` | Electron client: MediaPipe inference, signed transport, OS observation |
 | `apps/console` | Proctor console: triage queue, per-session audit timeline |
 | `proctor_gateway.store` | SQLite persistence + retention |
+| `proctor_identity` | Enrolment, face matching, temporal decision |
 
 The full chain has been run end-to-end — camera → MediaPipe → IPC → signed
 WebSocket → gateway → fusion → proctor stream — against a synthetic camera
@@ -85,7 +85,21 @@ their faces, so retention is a setting rather than a cleanup script:
 data past the window is purged at startup. `:memory:` disables
 persistence entirely.
 
-Not yet built: SFU and recording, identity verification, audio pipeline.
+Identity verification is built but **off by default**. It stays disabled
+until a threshold *and* a record of what population it was calibrated
+against are both supplied:
+
+```bash
+PROCTOR_IDENTITY_THRESHOLD=0.55 PROCTOR_IDENTITY_CALIBRATED_ON="internal, 2026-06"
+```
+
+There is no default cutoff because there is no cutoff that is correct
+across populations — face-match error rates vary by one to two orders of
+magnitude between demographic groups. **No face model is bundled**: the
+commonly available ArcFace weights are non-commercial-research-only.
+Point `PROCTOR_FACE_MODEL` at your own licensed ONNX export.
+
+Not yet built: SFU and recording, audio pipeline, ID document capture.
 
 ## Running the client
 
@@ -139,7 +153,7 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (98) and TypeScript (29). The suite has three parts, and the last
+Python (157) and TypeScript (29). The suite has three parts, and the last
 two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest
@@ -164,7 +178,10 @@ Electron, no volunteer.
   AGPL-3.0 and that reaches network services. Use RF-DETR, YOLOX, or a
   self-trained detector.
 - Face embeddings are biometric data under GDPR Art. 9, Illinois BIPA and
-  Texas CUBI. Consent and deletion paths are product requirements.
+  Texas CUBI. Consent and deletion paths are product requirements. BIPA in
+  particular carries statutory damages and a private right of action.
+- **No ArcFace weights are bundled** — the common ones are
+  non-commercial-research-only. See ARCHITECTURE.md § 5.4.2.
 - Read ARCHITECTURE.md § 3 before relying on any security property. It says
   plainly what each defence does not buy you, including a documented,
   unclosed gap in clock-stretch detection.

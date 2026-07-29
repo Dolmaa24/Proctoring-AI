@@ -57,6 +57,37 @@ class Settings:
     replay its whole earlier stream.
     """
 
+    face_model_path: str = ""
+    """ONNX face-embedding model. Empty selects the deterministic test double.
+
+    No model is bundled: the commonly available ArcFace weights, including
+    the InsightFace model zoo, are licensed for non-commercial research use
+    only, so shipping one would hand every downstream user a licence
+    violation. Supply your own licensed export.
+    """
+
+    identity_threshold: float | None = None
+    """Cosine cutoff for a face match. No default, deliberately.
+
+    Face-match error rates vary by one to two orders of magnitude across
+    demographic groups, so there is no cutoff that is correct everywhere.
+    Identity verification stays disabled until this and
+    `identity_calibrated_on` are both set.
+    """
+
+    identity_calibrated_on: str = ""
+    """What population and conditions the threshold was measured against."""
+
+    template_retention_days: int = 1
+    """How long face templates are kept, separate from everything else.
+
+    Much shorter than `retention_days` because a template has no review
+    value once the exam is over — a human compares recordings, not vectors
+    — while being the highest-risk row in the database. The similarity
+    scores derived from it survive on the longer clock, so the audit trail
+    outlives the biometric.
+    """
+
     retention_days: int = 30
     """How long violations and finished sessions are kept.
 
@@ -96,11 +127,29 @@ class Settings:
             console_token=os.environ.get("PROCTOR_CONSOLE_TOKEN") or secrets.token_urlsafe(24),
             db_path=os.environ.get("PROCTOR_DB_PATH", "proctor.db"),
             retention_days=int(os.environ.get("PROCTOR_RETENTION_DAYS", "30")),
+            face_model_path=os.environ.get("PROCTOR_FACE_MODEL", ""),
+            identity_threshold=(
+                float(threshold_raw)
+                if (threshold_raw := os.environ.get("PROCTOR_IDENTITY_THRESHOLD"))
+                else None
+            ),
+            identity_calibrated_on=os.environ.get("PROCTOR_IDENTITY_CALIBRATED_ON", ""),
+            template_retention_days=int(os.environ.get("PROCTOR_TEMPLATE_RETENTION_DAYS", "1")),
         )
 
     @property
     def has_persistent_secret(self) -> bool:
         return bool(os.environ.get("PROCTOR_MASTER_SECRET"))
+
+    @property
+    def identity_enabled(self) -> bool:
+        """Identity checks run only when a threshold *and* its provenance exist.
+
+        Failing closed on a missing calibration record is the point: an
+        unattributed cutoff invites the assumption that it is universal,
+        and it is not.
+        """
+        return self.identity_threshold is not None and bool(self.identity_calibrated_on.strip())
 
     @property
     def has_configured_console_token(self) -> bool:
