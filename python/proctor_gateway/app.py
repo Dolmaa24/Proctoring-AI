@@ -12,9 +12,12 @@ import asyncio
 import base64
 import contextlib
 import logging
+import secrets
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from proctor_fusion import FusionEngine, load_policy
@@ -30,10 +33,74 @@ from proctor_protocol import (
 from .config import Settings
 from .hub import ProctorHub
 from .sessions import IntegrityBreach, SessionRegistry, validate_against_policy
+from .triage import TriageBoard
 
 log = logging.getLogger("proctor.gateway")
 
 WS_CLOSE_POLICY_VIOLATION = 1008
+CONSOLE_SUBPROTOCOL = "proctor.console.v1"
+
+
+def _bearer(authorization: str | None) -> str:
+    if not authorization:
+        return ""
+    scheme, _, value = authorization.partition(" ")
+    return value.strip() if scheme.lower() == "bearer" else ""
+
+
+def _token_from_subprotocol(offered: str) -> str:
+    """Extract the token from `proctor.console.v1, token.<value>`."""
+    for part in offered.split(","):
+        candidate = part.strip()
+        if candidate.startswith("token."):
+            return candidate[len("token.") :]
+    return ""
+
+
+def _console_token_ok(settings: Settings, presented: str) -> bool:
+    if not settings.console_token:
+        return False
+    return secrets.compare_digest(settings.console_token, presented)
+
+
+def _require_console_token(settings: Settings, presented: str) -> None:
+    if not _console_token_ok(settings, presented):
+        raise HTTPException(status_code=401, detail="unauthorised")
+
+
+class _Broadcast:
+    """Updates triage state, then fans the message out to consoles.
+
+    Exposes the same `publish` as `ProctorHub` so it can be substituted at
+    every call site. Keeping the board update here — on the single path
+    every proctor-visible message already travels — means a new event kind
+    cannot be added that the console silently never learns about.
+    """
+
+    def __init__(self, hub: ProctorHub, board: TriageBoard, settings: Settings) -> None:
+        self._hub = hub
+        self._board = board
+        self._settings = settings
+
+    async def publish(self, message: dict[str, Any]) -> None:
+        now = self._settings.clock()
+        kind = message.get("kind")
+        session_id = message.get("session_id")
+
+        if kind == "violation" and session_id:
+            self._board.record_violation(message, now)
+        elif kind == "stream_connected" and session_id:
+            self._board.ensure(session_id, now, connected=True)
+        elif kind == "stream_disconnected" and session_id:
+            self._board.ensure(
+                session_id,
+                now,
+                connected=False,
+                ended_cleanly=message.get("ended_cleanly"),
+                events_received=message.get("events_received"),
+            )
+
+        await self._hub.publish(message)
 
 
 class CreateSessionRequest(BaseModel):
@@ -59,15 +126,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     engine = FusionEngine(policy)
     registry = SessionRegistry(skew_tolerance_ms=settings.clock_skew_tolerance_ms)
     hub = ProctorHub()
+    board = TriageBoard()
+    broadcast = _Broadcast(hub, board, settings)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
-        ticker = asyncio.create_task(_tick_loop(engine, hub, settings))
+        ticker = asyncio.create_task(_tick_loop(engine, broadcast, settings))
         log.info("gateway up: policy=%s rules=%d", policy.name, len(policy.rules))
         if not settings.has_persistent_secret:
             log.warning(
                 "PROCTOR_MASTER_SECRET is unset; using an ephemeral secret. "
                 "Sessions will not survive a restart. Do not run this way in production."
+            )
+        if not settings.has_configured_console_token and settings.console_token:
+            # Printed rather than left open. The proctor endpoints expose
+            # every candidate's flags, so there is no "convenient" mode
+            # where they are unauthenticated.
+            log.warning(
+                "PROCTOR_CONSOLE_TOKEN is unset; generated a token for this run only:\n"
+                "    %s\n"
+                "    console: http://localhost:8000/console",
+                settings.console_token,
             )
         for warning in validate_against_policy(
             settings.clock_skew_tolerance_ms,
@@ -97,6 +176,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_session(body: CreateSessionRequest) -> CreateSessionResponse:
         session = registry.create(body.exam_id, body.candidate_ref)
         engine.open_session(session.session_id, settings.clock())
+        board.ensure(
+            session.session_id,
+            settings.clock(),
+            exam_id=body.exam_id,
+            candidate_ref=body.candidate_ref,
+        )
         key = derive_session_key(settings.master_secret, session.session_id)
         return CreateSessionResponse(
             session_id=session.session_id,
@@ -136,11 +221,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine.set_connected(session_id, True)
         log.info("telemetry connected: %s", session_id)
 
-        await hub.publish({"kind": "stream_connected", "session_id": session_id})
+        await broadcast.publish({"kind": "stream_connected", "session_id": session_id})
         try:
             while True:
                 raw = await ws.receive_text()
-                await _handle_frame(raw, session, key, engine, hub, settings.clock())
+                await _handle_frame(raw, session, key, engine, broadcast, settings.clock())
         except WebSocketDisconnect:
             log.info("telemetry disconnected: %s", session_id)
         finally:
@@ -155,7 +240,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # falling silent, so it raises its own hard flag.
                 await _raise_breach(
                     engine,
-                    hub,
+                    broadcast,
                     session,
                     IntegrityBreach.ABANDONED,
                     f"telemetry closed after {session.events_received} events "
@@ -166,7 +251,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # A client vanishing mid-exam is itself proctoring-relevant: it
             # is what pulling the network cable looks like from here. The
             # console needs to see it, and it marks the end of the stream.
-            await hub.publish(
+            await broadcast.publish(
                 {
                     "kind": "stream_disconnected",
                     "session_id": session_id,
@@ -176,15 +261,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 }
             )
 
+    @app.get("/v1/proctor/sessions")
+    async def proctor_sessions(authorization: str | None = Header(default=None)):
+        _require_console_token(settings, _bearer(authorization))
+        return {"sessions": board.snapshot(settings.clock())}
+
     @app.websocket("/v1/proctor/stream")
     async def proctor_stream(ws: WebSocket) -> None:
-        await ws.accept()
+        # Browsers cannot set headers on a WebSocket handshake, so the token
+        # travels as a subprotocol rather than a query parameter — query
+        # strings end up in access logs and proxy history, and this one
+        # grants access to every candidate's flags.
+        offered = ws.headers.get("sec-websocket-protocol", "")
+        token = _token_from_subprotocol(offered)
+        if not _console_token_ok(settings, token):
+            log.warning("rejected unauthenticated proctor stream connection")
+            await ws.close(code=WS_CLOSE_POLICY_VIOLATION, reason="unauthorised")
+            return
+
+        await ws.accept(subprotocol=CONSOLE_SUBPROTOCOL)
         async with hub.subscribe() as queue:
             await ws.send_json(
                 {
                     "kind": "hello",
                     "policy": policy.name,
-                    "active_sessions": list(engine.active_sessions),
+                    "sessions": board.snapshot(settings.clock()),
                 }
             )
             try:
@@ -194,9 +295,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except WebSocketDisconnect:
                 return
 
+    # The console page itself carries no data — every byte it renders comes
+    # from the token-gated endpoints above — so serving it openly is fine.
+    console_dir = Path(__file__).resolve().parents[2] / "apps" / "console"
+    if console_dir.is_dir():
+        app.mount("/console", StaticFiles(directory=console_dir, html=True), name="console")
+
     app.state.engine = engine
     app.state.registry = registry
     app.state.hub = hub
+    app.state.board = board
     app.state.settings = settings
     return app
 
@@ -206,7 +314,7 @@ async def _handle_frame(
     session,
     key: bytes,
     engine: FusionEngine,
-    hub: ProctorHub,
+    hub: _Broadcast,
     server_ms: int,
 ) -> None:
     try:
@@ -256,7 +364,7 @@ async def _handle_frame(
 
 async def _raise_breach(
     engine: FusionEngine,
-    hub: ProctorHub,
+    hub: _Broadcast,
     session,
     breach: IntegrityBreach,
     detail: str,
@@ -282,7 +390,7 @@ async def _raise_breach(
     await hub.publish({"kind": "violation", **violation.as_dict()})
 
 
-async def _tick_loop(engine: FusionEngine, hub: ProctorHub, settings: Settings) -> None:
+async def _tick_loop(engine: FusionEngine, hub: _Broadcast, settings: Settings) -> None:
     """Drives absence-of-telemetry rules on a wall clock."""
     interval = settings.tick_interval_ms / 1000
     while True:

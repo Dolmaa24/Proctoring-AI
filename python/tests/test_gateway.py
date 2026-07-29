@@ -15,6 +15,8 @@ from proctor_gateway import Settings, create_app
 from proctor_sim import BEHAVIOURAL, SimulatedClient, Tamper
 
 MASTER = b"test-master-secret-not-for-production"
+CONSOLE_TOKEN = "test-console-token"
+CONSOLE_PROTOCOLS = ["proctor.console.v1", f"token.{CONSOLE_TOKEN}"]
 
 
 class FakeClock:
@@ -39,7 +41,12 @@ def clock() -> FakeClock:
 
 @pytest.fixture
 def client(clock: FakeClock) -> TestClient:
-    settings = Settings(master_secret=MASTER, clock=clock, tick_interval_ms=50)
+    settings = Settings(
+        master_secret=MASTER,
+        clock=clock,
+        tick_interval_ms=50,
+        console_token=CONSOLE_TOKEN,
+    )
     return TestClient(create_app(settings))
 
 
@@ -65,7 +72,7 @@ def run_scenario(
     base = clock.now
 
     violations: list[dict] = []
-    with client.websocket_connect("/v1/proctor/stream") as proctor:
+    with client.websocket_connect("/v1/proctor/stream", subprotocols=CONSOLE_PROTOCOLS) as proctor:
         hello = proctor.receive_json()
         assert hello["kind"] == "hello"
 
@@ -232,7 +239,7 @@ def test_a_gap_does_not_blind_the_rest_of_the_exam(client, clock):
     frames = list(sim.frames(BEHAVIOURAL["phone"][1]()))
 
     seen: set[str] = set()
-    with client.websocket_connect("/v1/proctor/stream") as proctor:
+    with client.websocket_connect("/v1/proctor/stream", subprotocols=CONSOLE_PROTOCOLS) as proctor:
         proctor.receive_json()
         with client.websocket_connect(f"/v1/sessions/{session_id}/telemetry") as ws:
             for index, (t_ms, frame) in enumerate(frames):
@@ -307,7 +314,7 @@ def test_monotonic_rewind_is_caught_regardless_of_size(client, clock):
     base = clock.now
 
     frames = list(sim.frames(script))
-    with client.websocket_connect("/v1/proctor/stream") as proctor:
+    with client.websocket_connect("/v1/proctor/stream", subprotocols=CONSOLE_PROTOCOLS) as proctor:
         proctor.receive_json()
         with client.websocket_connect(f"/v1/sessions/{session_id}/telemetry") as telemetry:
             for t_ms, frame in frames:
@@ -355,7 +362,7 @@ def test_killing_the_client_raises_abandonment(client, clock):
     base = clock.now
 
     seen: set[str] = set()
-    with client.websocket_connect("/v1/proctor/stream") as proctor:
+    with client.websocket_connect("/v1/proctor/stream", subprotocols=CONSOLE_PROTOCOLS) as proctor:
         proctor.receive_json()
         with client.websocket_connect(f"/v1/sessions/{session_id}/telemetry") as ws:
             for t_ms, frame in sim.frames(BEHAVIOURAL["honest"][1](2_000)):
@@ -435,3 +442,80 @@ def test_integrity_breaches_are_recorded_on_the_session(client, clock):
 
     status = client.get(f"/v1/sessions/{session_id}").json()
     assert status["integrity_breaches"], "breaches must be durable, not just broadcast"
+
+
+# -- proctor authentication -------------------------------------------------
+
+
+def test_proctor_stream_rejects_a_missing_token(client, clock):
+    """The stream carries every candidate's flags; it must not be open.
+
+    Without this the port is a live feed of who is being accused of what,
+    readable by anything that can reach it.
+    """
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/v1/proctor/stream") as ws:
+            ws.receive_json()
+
+
+def test_proctor_stream_rejects_a_wrong_token(client, clock):
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            "/v1/proctor/stream",
+            subprotocols=["proctor.console.v1", "token.not-the-right-token"],
+        ) as ws:
+            ws.receive_json()
+
+
+def test_proctor_sessions_endpoint_requires_a_token(client, clock):
+    assert client.get("/v1/proctor/sessions").status_code == 401
+    assert (
+        client.get("/v1/proctor/sessions", headers={"authorization": "Bearer wrong"}).status_code
+        == 401
+    )
+    ok = client.get("/v1/proctor/sessions", headers={"authorization": f"Bearer {CONSOLE_TOKEN}"})
+    assert ok.status_code == 200
+    assert "sessions" in ok.json()
+
+
+def test_an_empty_configured_token_does_not_authorise(clock):
+    """Fail closed. An unset token must never mean 'allow everyone'."""
+    settings = Settings(master_secret=MASTER, clock=clock, console_token="")
+    blank = TestClient(create_app(settings))
+    assert blank.get("/v1/proctor/sessions").status_code == 401
+    with pytest.raises(WebSocketDisconnect):
+        with blank.websocket_connect(
+            "/v1/proctor/stream", subprotocols=["proctor.console.v1", "token."]
+        ) as ws:
+            ws.receive_json()
+
+
+# -- triage surface ---------------------------------------------------------
+
+
+def test_triage_reflects_a_flagged_session(client, clock):
+    run_scenario(client, clock, "phone")
+    body = client.get(
+        "/v1/proctor/sessions", headers={"authorization": f"Bearer {CONSOLE_TOKEN}"}
+    ).json()
+    assert body["sessions"]
+    flagged = body["sessions"][0]
+    assert flagged["band"] in {"notice", "review"}
+    assert flagged["timeline"], "a flagged session must carry a reviewable timeline"
+
+
+def test_triage_leaves_an_honest_session_quiet(client, clock):
+    run_scenario(client, clock, "honest")
+    body = client.get(
+        "/v1/proctor/sessions", headers={"authorization": f"Bearer {CONSOLE_TOKEN}"}
+    ).json()
+    assert all(s["band"] == "quiet" for s in body["sessions"])
+
+
+def test_hello_frame_carries_the_current_board(client, clock):
+    """A console joining mid-exam must not start blind."""
+    run_scenario(client, clock, "phone")
+    with client.websocket_connect("/v1/proctor/stream", subprotocols=CONSOLE_PROTOCOLS) as ws:
+        hello = ws.receive_json()
+    assert hello["kind"] == "hello"
+    assert hello["sessions"], "hello must include a snapshot, not just live updates"

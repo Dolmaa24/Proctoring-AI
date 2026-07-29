@@ -48,6 +48,19 @@ class Settings:
 
     policy_path: str | None = None
 
+    console_token: str = ""
+    """Bearer token required to read the proctor stream.
+
+    The proctor endpoints carry every candidate's flags and evidence —
+    biometric-derived data about identifiable people. Unauthenticated, the
+    port is a live feed of who is being accused of what.
+
+    When unset, `from_env` generates a random token and logs it rather than
+    leaving the endpoint open. Failing closed with a printed dev token
+    keeps local work friction-free without ever producing a deployment that
+    is accidentally public.
+    """
+
     @classmethod
     def from_env(cls) -> Settings:
         raw = os.environ.get("PROCTOR_MASTER_SECRET")
@@ -61,8 +74,13 @@ class Settings:
         return cls(
             master_secret=master,
             policy_path=os.environ.get("PROCTOR_POLICY_PATH"),
+            console_token=os.environ.get("PROCTOR_CONSOLE_TOKEN") or secrets.token_urlsafe(24),
         )
 
     @property
     def has_persistent_secret(self) -> bool:
         return bool(os.environ.get("PROCTOR_MASTER_SECRET"))
+
+    @property
+    def has_configured_console_token(self) -> bool:
+        return bool(os.environ.get("PROCTOR_CONSOLE_TOKEN"))

@@ -24,6 +24,7 @@ apps/client/src/
   protocol/           generated types + WebCrypto signing
   main/               Electron main: OS observation, signed transport
   renderer/           camera, MediaPipe, gaze geometry
+apps/console/         static proctor console: triage queue + timeline
 policies/
   default.yaml        exam policy as reviewable data
 tools/
@@ -31,9 +32,8 @@ tools/
   conformance.ts            TS-signed frames for the Python verifier
 ```
 
-Planned, not yet built: `apps/console` (proctor dashboard),
-`services/identity` (ArcFace), `services/audio` (VAD → STT → intent),
-`services/media` (SFU + recording).
+Planned, not yet built: `services/identity` (ArcFace),
+`services/audio` (VAD → STT → intent), `services/media` (SFU + recording).
 
 ### 1.1 Why the schema is generated
 
@@ -195,6 +195,47 @@ confidence must not be able to either manufacture or cancel a violation.
 
 ---
 
+## 5.1 Triage and the console
+
+`proctor_gateway/triage.py` aggregates the violation stream into one row
+per session, ordered so the sessions worth a look sort first. Ordering is
+a recency-weighted flag count with a three-minute half-life, so a candidate
+who had one bad moment early on is not pinned to the top of an
+invigilator's screen for the rest of the exam.
+
+Three decisions in that file matter more than the arithmetic:
+
+**The score is server-side.** Two proctors must see the same queue, it must
+survive a refresh, and the logic deciding whose name floats to the top is
+consequential enough to belong somewhere unit tested. A decay function in
+dashboard JavaScript is none of those.
+
+**The score is never displayed.** It orders the queue; the console renders
+a coarse band (`quiet` / `notice` / `review`). A number beside a person's
+name is read as a confidence value by a tired human under time pressure, no
+matter how it is labelled, and this number is not one.
+
+**INFO severity contributes zero.** Capture-quality notes are context for
+review. A candidate with a bad webcam must not drift up the queue for it.
+
+The console (`apps/console/`) is static and served by the gateway. Its
+visual design is deliberately calm — the obvious design is a wall of red
+alerts, and it is the wrong one, because colour primes judgement and these
+flags come from models with measurable error rates against real people.
+
+## 5.2 Proctor authentication
+
+`/v1/proctor/*` requires a bearer token — as a subprotocol on the
+WebSocket, since browsers cannot set headers on a handshake and a query
+string would land in access logs.
+
+It **fails closed**. When `PROCTOR_CONSOLE_TOKEN` is unset the gateway
+generates a random token and logs it rather than leaving the endpoint open,
+so local work stays friction-free without there ever being a deployment
+that is accidentally public. These endpoints carry every candidate's flags
+and evidence; unauthenticated, the port is a live feed of who is being
+accused of what.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -231,7 +272,7 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 ## 8. Status
 
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
-client (61 Python + 29 TypeScript tests). The full chain has been run
+client, proctor console (83 Python + 29 TypeScript tests). The full chain has been run
 end-to-end against a synthetic camera feed in both the face-present and
 no-face cases; see `apps/client/scripts/e2e.mjs`.
 
@@ -246,7 +287,8 @@ thought of. Matching is now by exact basename with OS-vendor paths
 excluded, and a test runs against the real process table of whatever
 machine it is on.
 
-Not built: Electron client and edge inference, SFU and recording, identity
-verification, audio pipeline, proctor console, persistence (everything is
-in-memory), authn/authz on the proctor stream (currently unauthenticated —
-**do not expose this gateway publicly as it stands**).
+Not built: SFU and recording, identity verification, audio pipeline,
+persistence (everything is in-memory). The proctor stream is now
+token-authenticated and fails closed, but there is still no per-proctor
+identity, no audit of who looked at whom, and no TLS termination here —
+do not expose this gateway publicly without putting those in front of it.

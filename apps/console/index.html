@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proctor console</title>
+    <link rel="stylesheet" href="./console.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Proctor console</h1>
+      <div class="status">
+        <span id="link" class="link" data-state="off">disconnected</span>
+        <span id="counts" class="counts"></span>
+      </div>
+    </header>
+
+    <!-- Stated once, prominently, and not as a footnote. A proctor working
+         a queue at speed will absorb the framing of the interface far more
+         than any policy document they were given in training. -->
+    <p class="preamble">
+      These are <strong>flags for review</strong>, not findings. Every item
+      here was produced by a model with known error modes. Look at the
+      evidence before drawing a conclusion, and treat an absence of flags as
+      weak evidence of nothing in particular.
+    </p>
+
+    <main>
+      <section class="queue" aria-label="Sessions">
+        <div class="queue-head">
+          <h2>Sessions</h2>
+          <span id="ordering" class="hint">ordered by recent flag activity</span>
+        </div>
+        <ul id="sessions" class="sessions"></ul>
+        <p id="empty" class="empty">No sessions yet.</p>
+      </section>
+
+      <section class="detail" aria-label="Session detail">
+        <div id="detail-empty" class="empty">Select a session to see its timeline.</div>
+        <article id="detail" hidden>
+          <h2 id="detail-ref"></h2>
+          <dl class="meta" id="detail-meta"></dl>
+          <h3>Timeline</h3>
+          <p class="hint">Newest first. Times are server receipt time.</p>
+          <ol id="timeline" class="timeline"></ol>
+        </article>
+      </section>
+    </main>
+
+    <dialog id="auth">
+      <form method="dialog">
+        <h2>Console token</h2>
+        <p class="hint">
+          The gateway prints a token at startup when
+          <code>PROCTOR_CONSOLE_TOKEN</code> is unset.
+        </p>
+        <input id="token" type="password" autocomplete="off" placeholder="token" />
+        <button value="ok">Connect</button>
+      </form>
+    </dialog>
+
+    <script type="module" src="./console.js"></script>
+  </body>
+</html>

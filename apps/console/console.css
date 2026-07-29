@@ -1,0 +1,225 @@
+/*
+ * Deliberately calm.
+ *
+ * The obvious design for a proctoring console is a wall of red alerts, and
+ * it is the wrong one. Colour primes judgement: an interface that renders
+ * every flag as an emergency will produce proctors who see guilt, and the
+ * flags here are produced by models with measurable error rates against
+ * real people. Amber and a muted rust are as loud as this gets, the quiet
+ * state is genuinely quiet, and nothing pulses or animates for attention.
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --ink: #1b1a17;
+  --ink-soft: #6b6862;
+  --line: #e3e1dc;
+  --quiet: #8a8781;
+  --notice: #a4720f;
+  --notice-bg: #fdf5e4;
+  --review: #a33b23;
+  --review-bg: #fbeee9;
+  --ok: #3d7a4e;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16151300;
+    --bg: #161513;
+    --panel: #1e1d1a;
+    --ink: #ece9e3;
+    --ink-soft: #9a958c;
+    --line: #302e2a;
+    --quiet: #7d786f;
+    --notice: #d9a441;
+    --notice-bg: #2a2318;
+    --review: #d97757;
+    --review-bg: #2c1d18;
+    --ok: #7cb891;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+  /* Column flex so `main` can claim the remaining height exactly. A
+     `calc(100vh - <header height>)` would need updating every time the
+     header text reflows, and silently leaves a stub divider when it drifts. */
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.5rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+h2 { font-size: 0.95rem; margin: 0; font-weight: 620; }
+h3 { font-size: 0.85rem; margin: 1.25rem 0 0.35rem; font-weight: 620; }
+
+.status { display: flex; align-items: center; gap: 0.85rem; }
+
+.link {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--ink-soft);
+}
+.link[data-state="on"] { color: var(--ok); border-color: currentColor; }
+.link[data-state="error"] { color: var(--review); border-color: currentColor; }
+
+.counts { font-family: var(--mono); font-size: 0.75rem; color: var(--ink-soft); }
+
+.preamble {
+  margin: 0;
+  padding: 0.7rem 1.5rem;
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  border-bottom: 1px solid var(--line);
+  max-width: 90ch;
+}
+.preamble strong { color: var(--ink); font-weight: 620; }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) 1fr;
+  gap: 0;
+  /* stretch, not start: otherwise the column divider ends at the height of
+     whichever column is shorter and the layout looks broken on a light day. */
+  align-items: stretch;
+  flex: 1;
+}
+
+@media (max-width: 820px) {
+  main { grid-template-columns: 1fr; }
+  .detail { border-left: none !important; border-top: 1px solid var(--line); }
+}
+
+.queue { border-right: 1px solid var(--line); padding: 1rem 0 2rem; }
+.queue-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 0 1.25rem 0.6rem;
+}
+.hint { font-size: 0.75rem; color: var(--ink-soft); }
+
+.sessions { list-style: none; margin: 0; padding: 0; }
+
+.session {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.6rem;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  padding: 0.6rem 1.25rem;
+  background: none;
+  border: none;
+  border-left: 3px solid transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.session:hover { background: var(--panel); }
+.session[aria-current="true"] { background: var(--panel); border-left-color: var(--ink-soft); }
+
+.band {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.band[data-band="quiet"]  { color: var(--quiet); }
+.band[data-band="notice"] { color: var(--notice); background: var(--notice-bg); }
+.band[data-band="review"] { color: var(--review); background: var(--review-bg); }
+
+.who { min-width: 0; }
+.ref { font-family: var(--mono); font-size: 0.8rem; }
+.sub { font-size: 0.72rem; color: var(--ink-soft); }
+.tally { font-family: var(--mono); font-size: 0.72rem; color: var(--ink-soft); text-align: right; }
+
+.offline { color: var(--review); }
+
+.detail { padding: 1.25rem 1.5rem 3rem; border-left: 1px solid var(--line); }
+
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 1rem;
+  margin: 0.6rem 0 0;
+  font-size: 0.8rem;
+}
+.meta dt { color: var(--ink-soft); }
+.meta dd { margin: 0; font-family: var(--mono); }
+
+.timeline { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.entry {
+  display: grid;
+  grid-template-columns: 5.5rem auto 1fr;
+  gap: 0.75rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--line);
+  align-items: baseline;
+}
+.at { font-family: var(--mono); font-size: 0.72rem; color: var(--ink-soft); }
+.rule { font-family: var(--mono); font-size: 0.75rem; }
+.entry[data-severity="hard"] .rule { color: var(--review); }
+.entry[data-severity="soft"] .rule { color: var(--notice); }
+.entry[data-severity="info"] .rule { color: var(--quiet); }
+.entry[data-resolved="true"] { opacity: 0.55; }
+.msg { font-size: 0.8rem; }
+.dur { font-family: var(--mono); font-size: 0.72rem; color: var(--ink-soft); }
+
+.empty { padding: 1.5rem; color: var(--ink-soft); font-size: 0.85rem; }
+
+dialog {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 1.25rem;
+  max-width: 34ch;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+dialog input {
+  width: 100%;
+  margin: 0.6rem 0;
+  padding: 0.45rem 0.55rem;
+  font-family: var(--mono);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+}
+dialog button {
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+code { font-family: var(--mono); font-size: 0.75rem; }

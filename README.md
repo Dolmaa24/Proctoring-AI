@@ -7,8 +7,9 @@ and evidence. Raw video never touches the telemetry path.
 Rebuilt from scratch. The original OpenCV desktop scripts are preserved on
 the `upstream/master` remote for reference.
 
-> **Not production ready.** No authentication on the proctor stream, no
-> persistence, no identity verification yet. See ARCHITECTURE.md § 8.
+> **Not production ready.** No persistence, no identity verification, no
+> session recording. See ARCHITECTURE.md § 8 for the full list, and § 3.2
+> for a documented, unclosed gap in clock-stretch detection.
 
 ---
 
@@ -27,8 +28,14 @@ Run the tests — no webcam, no models, no candidate required:
 Start the gateway:
 
 ```bash
-PROCTOR_MASTER_SECRET=dev-secret .venv/bin/uvicorn proctor_gateway.app:app --reload
+PROCTOR_MASTER_SECRET=dev-secret PROCTOR_CONSOLE_TOKEN=dev-token .venv/bin/uvicorn proctor_gateway.app:app --reload
 ```
+
+The proctor console is then at <http://localhost:8000/console>. It asks
+for the token above; leave `PROCTOR_CONSOLE_TOKEN` unset and the gateway
+generates one and logs it at startup. The proctor endpoints **fail
+closed** — there is no unauthenticated mode, because they carry every
+candidate's flags.
 
 Drive a simulated candidate against it:
 
@@ -44,11 +51,7 @@ Drive a simulated candidate against it:
 .venv/bin/python -m proctor_sim --scenario look_away --tamper drop_events
 ```
 
-Watch what a proctor would see:
 
-```bash
-websocat ws://localhost:8000/v1/proctor/stream
-```
 
 ---
 
@@ -62,13 +65,14 @@ websocat ws://localhost:8000/v1/proctor/stream
 | `proctor_sim` | Scripted candidates + six client-tampering modes |
 | `policies/default.yaml` | 16 rules, all flag-only |
 | `apps/client` | Electron client: MediaPipe inference, signed transport, OS observation |
+| `apps/console` | Proctor console: triage queue, per-session audit timeline |
 
 The full chain has been run end-to-end — camera → MediaPipe → IPC → signed
 WebSocket → gateway → fusion → proctor stream — against a synthetic camera
 feed, in both the face-present and no-face cases.
 
 Not yet built: SFU and recording, identity verification, audio pipeline,
-proctor console, persistence.
+persistence.
 
 ## Running the client
 
@@ -122,7 +126,7 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (61) and TypeScript (23). The suite has three parts, and the last
+Python (83) and TypeScript (29). The suite has three parts, and the last
 two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest
