@@ -236,6 +236,62 @@ that is accidentally public. These endpoints carry every candidate's flags
 and evidence; unauthenticated, the port is a live feed of who is being
 accused of what.
 
+## 5.3 Persistence
+
+`proctor_gateway/store.py`. SQLite, WAL, single file, behind a narrow
+`Store` interface so Postgres can replace it without touching the request
+handlers. `PROCTOR_DB_PATH=:memory:` selects a real no-op implementation
+rather than branching the gateway.
+
+**This is a security requirement, not a convenience.** Replay protection
+works by refusing a sequence number already seen. With `last_seq` in memory
+only, restarting the gateway resets it to −1 and a client can re-send its
+entire earlier stream — every "face present, looking at the screen" frame
+it has already spent. A restart must not be a way to launder a replay, and
+`test_restart_does_not_launder_a_replay` is the test that says so.
+
+Session state is checkpointed on **every frame**, so the window in which a
+crash could permit a replay is one frame wide. Measured: ~43,000
+checkpoints/sec, which is roughly 4,300 concurrent candidates at 10Hz
+before the store becomes the bottleneck. `synchronous=NORMAL` trades a
+few commits on power loss for that throughput; `FULL` would fsync per
+commit and make ingest disk-bound.
+
+What is deliberately **not** persisted: the fusion engine's per-rule onset
+timers. A candidate mid-look-away when the gateway restarts gets a fresh
+onset window. That errs toward not flagging, which is the right direction,
+and a candidate cannot trigger a restart to exploit it.
+
+Sessions are always restored as **disconnected**. Restoring `connected=True`
+would show a proctor a live candidate who is not there, and would have the
+silence rule evaluated against a stream that does not exist.
+
+### 5.3.1 Retention
+
+`PROCTOR_RETENTION_DAYS`, default 30. Violations and finished sessions
+older than the window are purged at startup.
+
+This is not housekeeping. Every evidence row is an observation about an
+identifiable person derived from their face; keeping it past the point it
+is needed for review is the difference between a proctoring system and a
+biometric archive. Institutions with a shorter statutory limit should lower
+it, and `0` disables purging for jurisdictions that mandate longer holds.
+
+Purge runs **before** restore. The other order loads expired rows into
+memory and only then deletes them from disk, so the board keeps showing
+candidates whose data was supposed to be gone and their sessions still
+accept a telemetry socket — retention that applies only to the database is
+not retention. That bug existed for about ten minutes and is now pinned by
+`test_websocket_for_a_purged_session_is_rejected`.
+
+### 5.3.2 Interaction with the master secret
+
+Session keys are derived from `PROCTOR_MASTER_SECRET`. With persistence on
+and that secret unset, a restart restores the sessions but derives
+*different* keys for them, so every frame from a resuming client fails its
+signature check and the candidate is flagged for something the server did.
+The startup warning says this explicitly when both conditions hold.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -272,7 +328,7 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 ## 8. Status
 
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
-client, proctor console (83 Python + 29 TypeScript tests). The full chain has been run
+client, proctor console, persistence (98 Python + 29 TypeScript tests). The full chain has been run
 end-to-end against a synthetic camera feed in both the face-present and
 no-face cases; see `apps/client/scripts/e2e.mjs`.
 
@@ -287,8 +343,8 @@ thought of. Matching is now by exact basename with OS-vendor paths
 excluded, and a test runs against the real process table of whatever
 machine it is on.
 
-Not built: SFU and recording, identity verification, audio pipeline,
-persistence (everything is in-memory). The proctor stream is now
+Not built: SFU and recording, identity verification, audio pipeline.
+The proctor stream is now
 token-authenticated and fails closed, but there is still no per-proctor
 identity, no audit of who looked at whom, and no TLS termination here —
 do not expose this gateway publicly without putting those in front of it.

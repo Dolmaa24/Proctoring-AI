@@ -7,8 +7,8 @@ and evidence. Raw video never touches the telemetry path.
 Rebuilt from scratch. The original OpenCV desktop scripts are preserved on
 the `upstream/master` remote for reference.
 
-> **Not production ready.** No persistence, no identity verification, no
-> session recording. See ARCHITECTURE.md § 8 for the full list, and § 3.2
+> **Not production ready.** No identity verification, no session
+> recording. See ARCHITECTURE.md § 8 for the full list, and § 3.2
 > for a documented, unclosed gap in clock-stretch detection.
 
 ---
@@ -66,13 +66,26 @@ Drive a simulated candidate against it:
 | `policies/default.yaml` | 16 rules, all flag-only |
 | `apps/client` | Electron client: MediaPipe inference, signed transport, OS observation |
 | `apps/console` | Proctor console: triage queue, per-session audit timeline |
+| `proctor_gateway.store` | SQLite persistence + retention |
 
 The full chain has been run end-to-end — camera → MediaPipe → IPC → signed
 WebSocket → gateway → fusion → proctor stream — against a synthetic camera
 feed, in both the face-present and no-face cases.
 
-Not yet built: SFU and recording, identity verification, audio pipeline,
-persistence.
+State survives a restart — sessions, the triage board, and the audit
+trail. Sequence state in particular *must* survive: without it a restart
+would let a client replay its earlier stream unchallenged.
+
+```bash
+PROCTOR_DB_PATH=proctor.db PROCTOR_RETENTION_DAYS=30
+```
+
+Evidence rows are observations about identifiable people derived from
+their faces, so retention is a setting rather than a cleanup script:
+data past the window is purged at startup. `:memory:` disables
+persistence entirely.
+
+Not yet built: SFU and recording, identity verification, audio pipeline.
 
 ## Running the client
 
@@ -126,7 +139,7 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (83) and TypeScript (29). The suite has three parts, and the last
+Python (98) and TypeScript (29). The suite has three parts, and the last
 two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest

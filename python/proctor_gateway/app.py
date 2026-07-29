@@ -33,6 +33,7 @@ from proctor_protocol import (
 from .config import Settings
 from .hub import ProctorHub
 from .sessions import IntegrityBreach, SessionRegistry, validate_against_policy
+from .store import open_store
 from .triage import TriageBoard
 
 log = logging.getLogger("proctor.gateway")
@@ -77,10 +78,17 @@ class _Broadcast:
     cannot be added that the console silently never learns about.
     """
 
-    def __init__(self, hub: ProctorHub, board: TriageBoard, settings: Settings) -> None:
+    def __init__(
+        self,
+        hub: ProctorHub,
+        board: TriageBoard,
+        settings: Settings,
+        store: Any,
+    ) -> None:
         self._hub = hub
         self._board = board
         self._settings = settings
+        self._store = store
 
     async def publish(self, message: dict[str, Any]) -> None:
         now = self._settings.clock()
@@ -89,6 +97,10 @@ class _Broadcast:
 
         if kind == "violation" and session_id:
             self._board.record_violation(message, now)
+            # Written before the fan-out. A flag raised against someone and
+            # then lost to a restart is worse than never flagging: a proctor
+            # may already have seen it, and the evidence for it is gone.
+            self._store.append_violation(message, now)
         elif kind == "stream_connected" and session_id:
             self._board.ensure(session_id, now, connected=True)
         elif kind == "stream_disconnected" and session_id:
@@ -124,19 +136,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     policy = load_policy(settings.policy_path)
     engine = FusionEngine(policy)
-    registry = SessionRegistry(skew_tolerance_ms=settings.clock_skew_tolerance_ms)
+    store = open_store(settings.db_path)
+    registry = SessionRegistry(
+        skew_tolerance_ms=settings.clock_skew_tolerance_ms,
+        store=store,
+        clock=settings.clock,
+    )
     hub = ProctorHub()
     board = TriageBoard()
-    broadcast = _Broadcast(hub, board, settings)
+    broadcast = _Broadcast(hub, board, settings, store)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
+        # Purge before restore, not after. The other order loads expired
+        # rows into memory and only then deletes them from disk, so the
+        # board keeps showing candidates whose data was supposed to be gone
+        # and their sessions still accept a telemetry socket. Retention that
+        # only applies to the database is not retention.
+        _purge(store, settings)
+        restored = _restore(store, registry, board, engine, settings)
+        if restored:
+            log.info("restored %d session(s) from %s", restored, settings.db_path)
         ticker = asyncio.create_task(_tick_loop(engine, broadcast, settings))
         log.info("gateway up: policy=%s rules=%d", policy.name, len(policy.rules))
         if not settings.has_persistent_secret:
+            # Sharper than it looks. Session keys are derived from this
+            # secret, so with persistence enabled a restart restores the
+            # sessions but derives different keys for them: every frame
+            # from a resuming client then fails its signature check and the
+            # candidate is flagged for something the server did.
+            severity = (
+                "Restored sessions will reject their clients' frames."
+                if settings.db_path != ":memory:"
+                else "Sessions will not survive a restart."
+            )
             log.warning(
-                "PROCTOR_MASTER_SECRET is unset; using an ephemeral secret. "
-                "Sessions will not survive a restart. Do not run this way in production."
+                "PROCTOR_MASTER_SECRET is unset; using an ephemeral secret. %s "
+                "Do not run this way in production.",
+                severity,
             )
         if not settings.has_configured_console_token and settings.console_token:
             # Printed rather than left open. The proctor endpoints expose
@@ -159,6 +196,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ticker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await ticker
+            store.close()
 
     app = FastAPI(title="Proctor Gateway", version="0.1.0", lifespan=lifespan)
 
@@ -226,10 +264,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             while True:
                 raw = await ws.receive_text()
                 await _handle_frame(raw, session, key, engine, broadcast, settings.clock())
+                # Checkpoint on every frame. `last_seq` is what makes replay
+                # detection work, so the window in which a crash could let a
+                # client re-send already-used sequence numbers is one frame
+                # wide rather than a whole exam.
+                registry.persist(session)
         except WebSocketDisconnect:
             log.info("telemetry disconnected: %s", session_id)
         finally:
             session.connected = False
+            registry.persist(session)
             # Stop the silence rule from firing forever on a session whose
             # client has gone. Disconnection is its own event, below.
             engine.set_connected(session_id, False)
@@ -305,6 +349,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.registry = registry
     app.state.hub = hub
     app.state.board = board
+    app.state.store = store
     app.state.settings = settings
     return app
 
@@ -388,6 +433,74 @@ async def _raise_breach(
         session.session_id, str(breach), annotated, server_ms
     )
     await hub.publish({"kind": "violation", **violation.as_dict()})
+
+
+RESTORED_VIOLATIONS_PER_SESSION = 200
+
+
+def _restore(
+    store: Any,
+    registry: SessionRegistry,
+    board: TriageBoard,
+    engine: FusionEngine,
+    settings: Settings,
+) -> int:
+    """Rebuild in-memory state from the durable store.
+
+    Order matters: sessions first so the board has metadata to attach, then
+    violations replayed oldest-first because both the timeline and the
+    decaying score depend on arrival order.
+
+    Note what is deliberately *not* restored: the fusion engine's per-rule
+    onset timers. Those are transient — a candidate mid-look-away when the
+    gateway restarts gets a fresh onset window. That errs toward not
+    flagging, which is the right direction to err, and a candidate cannot
+    trigger a restart to exploit it.
+    """
+    records = store.load_sessions()
+    if not records:
+        return 0
+
+    restored = registry.restore(records)
+    now = settings.clock()
+
+    for record in records:
+        engine.open_session(record.session_id, now)
+        # Sessions come back disconnected, so the silence rule must not
+        # fire on them until a client actually attaches.
+        engine.set_connected(record.session_id, False)
+        if record.ended_cleanly:
+            engine.close_session(record.session_id)
+        board.ensure(
+            record.session_id,
+            record.created_ms,
+            exam_id=record.exam_id,
+            candidate_ref=record.candidate_ref,
+            connected=False,
+            ended_cleanly=record.ended_cleanly,
+            events_received=record.events_received,
+        )
+
+    for session_id, violations in store.load_violations(RESTORED_VIOLATIONS_PER_SESSION).items():
+        for violation in violations:
+            board.record_violation(violation, violation.get("recorded_ms", now))
+        log.debug("restored %d violation(s) for %s", len(violations), session_id)
+
+    return restored
+
+
+def _purge(store: Any, settings: Settings) -> None:
+    if settings.retention_days <= 0:
+        return
+    cutoff = settings.clock() - settings.retention_days * 86_400_000
+    violations, sessions = store.purge_older_than(cutoff)
+    if violations or sessions:
+        log.info(
+            "retention: removed %d violation(s) and %d session(s) older than %d days",
+            violations,
+            sessions,
+            settings.retention_days,
+        )
 
 
 async def _tick_loop(engine: FusionEngine, hub: _Broadcast, settings: Settings) -> None:

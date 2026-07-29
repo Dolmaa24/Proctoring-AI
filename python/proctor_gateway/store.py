@@ -1,0 +1,344 @@
+"""Durable state: sessions, violations, and the audit trail.
+
+Persistence here is not only about convenience. Two of the three things
+this module stores are load-bearing for correctness or for people:
+
+**`last_seq` and `last_monotonic_ms` are a security property.** Replay
+protection works by refusing a sequence number already seen. If those
+counters live only in memory, restarting the gateway resets them to -1 and
+a hostile client can re-send its entire earlier stream — every "face
+present, looking at the screen" frame it has already used — and nothing
+notices. A restart must not be a way to launder a replay.
+
+**Violations are the audit trail.** They are what a human reviews before
+deciding anything about a candidate. Losing them on a restart means a flag
+was raised against someone and the evidence for it is gone, which is worse
+than never having flagged at all.
+
+**Evidence is personal data.** Landmark-derived observations about an
+identifiable person, at rest on disk, indefinitely, is a liability under
+GDPR Art. 9 and BIPA-style statutes. Hence `retention_days` and the purge
+on startup — a proctoring system that silently accumulates biometric
+evidence forever is a compliance incident waiting to be discovered.
+
+SQLite because it is stdlib, single-file, ACID and entirely adequate at
+this scale. The `Store` interface is deliberately narrow so that swapping
+in Postgres for horizontal scale does not touch the request handlers.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+SCHEMA_VERSION = 1
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id         TEXT PRIMARY KEY,
+    exam_id            TEXT NOT NULL,
+    candidate_ref      TEXT NOT NULL,
+    created_ms         INTEGER NOT NULL,
+    last_seq           INTEGER NOT NULL,
+    last_monotonic_ms  INTEGER NOT NULL,
+    first_client_ms    INTEGER,
+    first_server_ms    INTEGER,
+    events_received    INTEGER NOT NULL,
+    ended_cleanly      INTEGER NOT NULL,
+    attested_build     TEXT,
+    integrity_breaches TEXT NOT NULL,
+    breach_counts      TEXT NOT NULL,
+    signal_counts      TEXT NOT NULL,
+    updated_ms         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS violations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    violation_id  TEXT NOT NULL,
+    rule_id       TEXT NOT NULL,
+    severity      TEXT NOT NULL,
+    message       TEXT NOT NULL,
+    opened_at_ms  INTEGER NOT NULL,
+    fired_at_ms   INTEGER NOT NULL,
+    duration_ms   INTEGER NOT NULL,
+    resolved      INTEGER NOT NULL,
+    recorded_ms   INTEGER NOT NULL,
+    evidence      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS violations_by_session
+    ON violations (session_id, recorded_ms);
+CREATE INDEX IF NOT EXISTS violations_by_age
+    ON violations (recorded_ms);
+CREATE INDEX IF NOT EXISTS sessions_by_age
+    ON sessions (updated_ms);
+"""
+
+
+@dataclass(slots=True)
+class SessionRecord:
+    """A session as it was last written. `connected` is deliberately absent.
+
+    Nothing is connected immediately after a restart, so restoring a stored
+    `connected=True` would show a proctor a live candidate who is not there
+    and would suppress the silence rule for a session with no client.
+    """
+
+    session_id: str
+    exam_id: str
+    candidate_ref: str
+    created_ms: int
+    last_seq: int
+    last_monotonic_ms: int
+    first_client_ms: int | None
+    first_server_ms: int | None
+    events_received: int
+    ended_cleanly: bool
+    attested_build: str | None
+    integrity_breaches: list[str]
+    breach_counts: dict[str, int]
+    signal_counts: dict[str, int]
+
+
+class Store(Protocol):
+    def load_sessions(self) -> list[SessionRecord]: ...
+    def save_session(self, record: SessionRecord, now_ms: int) -> None: ...
+    def append_violation(self, violation: dict[str, Any], now_ms: int) -> None: ...
+    def load_violations(self, per_session: int) -> dict[str, list[dict[str, Any]]]: ...
+    def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]: ...
+    def close(self) -> None: ...
+
+
+class MemoryStore:
+    """No-op store. Keeps the ephemeral path a real implementation.
+
+    Used by the test suite and by anyone running without a database, so
+    that "no persistence" is a store choice rather than a branch threaded
+    through the gateway.
+    """
+
+    def load_sessions(self) -> list[SessionRecord]:
+        return []
+
+    def save_session(self, record: SessionRecord, now_ms: int) -> None:
+        return None
+
+    def append_violation(self, violation: dict[str, Any], now_ms: int) -> None:
+        return None
+
+    def load_violations(self, per_session: int) -> dict[str, list[dict[str, Any]]]:
+        return {}
+
+    def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]:
+        return (0, 0)
+
+    def close(self) -> None:
+        return None
+
+
+class SqliteStore:
+    """Single-file durable store.
+
+    Runs in WAL mode with `synchronous=NORMAL`. That trades a small window
+    on power loss (the last few commits) for write throughput high enough
+    to checkpoint session state on every telemetry event. The alternative,
+    `synchronous=FULL`, fsyncs per commit and would make the ingest path
+    disk-bound. The residual exposure is bounded and stated in the module
+    docstring; losing the last second of sequence state to a power cut is
+    acceptable, losing all of it to an ordinary restart is not.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+        # check_same_thread=False plus an explicit lock: handlers run on the
+        # event loop thread but the tick loop and shutdown hooks may not.
+        self._db = sqlite3.connect(self.path, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        with self._lock:
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA synchronous=NORMAL")
+            self._db.executescript(_SCHEMA)
+            self._db.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            self._db.commit()
+
+    # -- sessions ----------------------------------------------------------
+
+    def load_sessions(self) -> list[SessionRecord]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM sessions").fetchall()
+        return [
+            SessionRecord(
+                session_id=row["session_id"],
+                exam_id=row["exam_id"],
+                candidate_ref=row["candidate_ref"],
+                created_ms=row["created_ms"],
+                last_seq=row["last_seq"],
+                last_monotonic_ms=row["last_monotonic_ms"],
+                first_client_ms=row["first_client_ms"],
+                first_server_ms=row["first_server_ms"],
+                events_received=row["events_received"],
+                ended_cleanly=bool(row["ended_cleanly"]),
+                attested_build=row["attested_build"],
+                integrity_breaches=json.loads(row["integrity_breaches"]),
+                breach_counts=json.loads(row["breach_counts"]),
+                signal_counts=json.loads(row["signal_counts"]),
+            )
+            for row in rows
+        ]
+
+    def save_session(self, record: SessionRecord, now_ms: int) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, exam_id, candidate_ref, created_ms, last_seq,
+                    last_monotonic_ms, first_client_ms, first_server_ms,
+                    events_received, ended_cleanly, attested_build,
+                    integrity_breaches, breach_counts, signal_counts, updated_ms
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    last_seq          = excluded.last_seq,
+                    last_monotonic_ms = excluded.last_monotonic_ms,
+                    first_client_ms   = excluded.first_client_ms,
+                    first_server_ms   = excluded.first_server_ms,
+                    events_received   = excluded.events_received,
+                    ended_cleanly     = excluded.ended_cleanly,
+                    attested_build    = excluded.attested_build,
+                    integrity_breaches= excluded.integrity_breaches,
+                    breach_counts     = excluded.breach_counts,
+                    signal_counts     = excluded.signal_counts,
+                    updated_ms        = excluded.updated_ms
+                """,
+                (
+                    record.session_id,
+                    record.exam_id,
+                    record.candidate_ref,
+                    record.created_ms,
+                    record.last_seq,
+                    record.last_monotonic_ms,
+                    record.first_client_ms,
+                    record.first_server_ms,
+                    record.events_received,
+                    int(record.ended_cleanly),
+                    record.attested_build,
+                    json.dumps(record.integrity_breaches),
+                    json.dumps(record.breach_counts),
+                    json.dumps(record.signal_counts),
+                    now_ms,
+                ),
+            )
+            self._db.commit()
+
+    # -- violations --------------------------------------------------------
+
+    def append_violation(self, violation: dict[str, Any], now_ms: int) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO violations (
+                    session_id, violation_id, rule_id, severity, message,
+                    opened_at_ms, fired_at_ms, duration_ms, resolved,
+                    recorded_ms, evidence
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    violation["session_id"],
+                    violation["violation_id"],
+                    violation["rule_id"],
+                    violation["severity"],
+                    violation["message"],
+                    violation.get("opened_at_ms", 0),
+                    violation.get("fired_at_ms", 0),
+                    violation.get("duration_ms", 0),
+                    int(bool(violation.get("resolved"))),
+                    now_ms,
+                    json.dumps(violation.get("evidence", [])),
+                ),
+            )
+            self._db.commit()
+
+    def load_violations(self, per_session: int) -> dict[str, list[dict[str, Any]]]:
+        """Most recent `per_session` violations per session, oldest first.
+
+        Oldest first because the caller replays them into the triage board
+        in order, and the board's timeline and score both depend on
+        arrival order.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY session_id ORDER BY recorded_ms DESC, id DESC
+                    ) AS rank FROM violations
+                ) WHERE rank <= ?
+                ORDER BY recorded_ms ASC, id ASC
+                """,
+                (per_session,),
+            ).fetchall()
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(row["session_id"], []).append(
+                {
+                    "session_id": row["session_id"],
+                    "violation_id": row["violation_id"],
+                    "rule_id": row["rule_id"],
+                    "severity": row["severity"],
+                    "message": row["message"],
+                    "opened_at_ms": row["opened_at_ms"],
+                    "fired_at_ms": row["fired_at_ms"],
+                    "duration_ms": row["duration_ms"],
+                    "resolved": bool(row["resolved"]),
+                    "recorded_ms": row["recorded_ms"],
+                    "evidence": json.loads(row["evidence"]),
+                }
+            )
+        return grouped
+
+    # -- retention ---------------------------------------------------------
+
+    def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]:
+        """Delete data older than the cutoff. Returns (violations, sessions).
+
+        Retention is not housekeeping. Every row here is an observation
+        about an identifiable person derived from their face; keeping it
+        past the point it is needed for review is the difference between a
+        proctoring system and a biometric archive.
+        """
+        with self._lock:
+            violations = self._db.execute(
+                "DELETE FROM violations WHERE recorded_ms < ?", (cutoff_ms,)
+            ).rowcount
+            sessions = self._db.execute(
+                "DELETE FROM sessions WHERE updated_ms < ?", (cutoff_ms,)
+            ).rowcount
+            self._db.commit()
+        return (max(0, violations), max(0, sessions))
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.commit()
+            self._db.close()
+
+
+def open_store(path: str) -> Store:
+    """`:memory:` selects the no-op store; anything else is a SQLite file."""
+    if path == ":memory:":
+        return MemoryStore()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return SqliteStore(path)

@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import secrets
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
+
+from .store import SessionRecord
 
 BREACH_COOLDOWN_MS = 10_000
 """Minimum gap between broadcasts of the same breach kind on one session."""
@@ -78,6 +82,24 @@ class Session:
     def count_signal(self, payload_type: str) -> None:
         self.signal_counts[payload_type] = self.signal_counts.get(payload_type, 0) + 1
 
+    def to_record(self) -> SessionRecord:
+        return SessionRecord(
+            session_id=self.session_id,
+            exam_id=self.exam_id,
+            candidate_ref=self.candidate_ref,
+            created_ms=self.created_ms,
+            last_seq=self.last_seq,
+            last_monotonic_ms=self.last_monotonic_ms,
+            first_client_ms=self.first_client_ms,
+            first_server_ms=self.first_server_ms,
+            events_received=self.events_received,
+            ended_cleanly=self.ended_cleanly,
+            attested_build=self.attested_build,
+            integrity_breaches=list(self.integrity_breaches),
+            breach_counts=dict(self.breach_counts),
+            signal_counts=dict(self.signal_counts),
+        )
+
     def should_report_breach(
         self, kind: str, now_ms: int, cooldown_ms: int = BREACH_COOLDOWN_MS
     ) -> bool:
@@ -132,6 +154,19 @@ class Session:
         session. That is why tolerance must stay below the shortest onset
         in the policy, and why `validate_against_policy` exists.
         """
+        # Replay is checked before the clock, and the order is not arbitrary.
+        # A replayed frame trips both rules — its sequence number is stale
+        # *and* its monotonic counter has gone backwards — so whichever runs
+        # first decides the label. `stream_replay` is the precise diagnosis
+        # and `stream_clock_skew` is a symptom of it; a reviewer reading the
+        # breach log deserves the former.
+        if seq <= self.last_seq:
+            return IntegrityResult(
+                ok=False,
+                breach=IntegrityBreach.REPLAY,
+                detail=f"received seq {seq} after {self.last_seq}",
+            )
+
         if ts_monotonic_ms < self.last_monotonic_ms:
             return IntegrityResult(
                 ok=False,
@@ -140,13 +175,6 @@ class Session:
                     f"monotonic counter went backwards: {ts_monotonic_ms} "
                     f"after {self.last_monotonic_ms}"
                 ),
-            )
-
-        if seq <= self.last_seq:
-            return IntegrityResult(
-                ok=False,
-                breach=IntegrityBreach.REPLAY,
-                detail=f"received seq {seq} after {self.last_seq}",
             )
 
         expected = self.last_seq + 1
@@ -213,26 +241,71 @@ def validate_against_policy(skew_tolerance_ms: int, min_onset_ms: int) -> list[s
 
 
 class SessionRegistry:
-    """In-memory session store.
+    """Session store, backed by an optional durable `Store`.
 
-    Deliberately behind a narrow interface. Everything here is a dict lookup
-    today; swapping in Redis for horizontal scale should not require touching
-    the gateway's request handlers.
+    Lookups stay in memory; writes are mirrored to the store so that
+    sequence and clock state survive a restart. Redis or Postgres can
+    replace the backing store without touching the request handlers.
     """
 
-    def __init__(self, skew_tolerance_ms: int = 2_000) -> None:
+    def __init__(
+        self,
+        skew_tolerance_ms: int = 2_000,
+        store: Any | None = None,
+        clock: Any | None = None,
+    ) -> None:
         self._sessions: dict[str, Session] = {}
         self._skew_tolerance_ms = skew_tolerance_ms
+        self._store = store
+        self._clock = clock or now_ms
+
+    def restore(self, records: Iterable[Any]) -> int:
+        """Rebuild sessions from durable records. Returns how many loaded.
+
+        Nothing is restored as connected: no client is attached immediately
+        after a restart, and a session that claimed otherwise would show a
+        proctor a candidate who is not there while suppressing the silence
+        rule for a stream that does not exist.
+        """
+        count = 0
+        for record in records:
+            self._sessions[record.session_id] = Session(
+                session_id=record.session_id,
+                exam_id=record.exam_id,
+                candidate_ref=record.candidate_ref,
+                created_ms=record.created_ms,
+                last_seq=record.last_seq,
+                first_client_ms=record.first_client_ms,
+                first_server_ms=record.first_server_ms,
+                events_received=record.events_received,
+                connected=False,
+                ended_cleanly=record.ended_cleanly,
+                attested_build=record.attested_build,
+                integrity_breaches=list(record.integrity_breaches),
+                skew_tolerance_ms=self._skew_tolerance_ms,
+                last_monotonic_ms=record.last_monotonic_ms,
+                breach_counts=dict(record.breach_counts),
+                signal_counts=dict(record.signal_counts),
+            )
+            count += 1
+        return count
+
+    def persist(self, session: Session) -> None:
+        """Mirror a session's current state to the durable store."""
+        if self._store is None:
+            return
+        self._store.save_session(session.to_record(), self._clock())
 
     def create(self, exam_id: str, candidate_ref: str) -> Session:
         session = Session(
             session_id=new_session_id(),
             exam_id=exam_id,
             candidate_ref=candidate_ref,
-            created_ms=now_ms(),
+            created_ms=self._clock(),
             skew_tolerance_ms=self._skew_tolerance_ms,
         )
         self._sessions[session.session_id] = session
+        self.persist(session)
         return session
 
     def get(self, session_id: str) -> Session | None:

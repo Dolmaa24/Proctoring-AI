@@ -25,3 +25,10 @@ apps/client/src/renderer/models/
 apps/client/dist/
 apps/client/fixtures/
 apps/client/.probe/
+
+# Durable gateway state. Contains violation evidence — observations about
+# identifiable people derived from their faces. Never commit it.
+proctor.db
+proctor.db-wal
+proctor.db-shm
+*.db

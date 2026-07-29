@@ -29,6 +29,8 @@ lint:
 
 dev:
 	PROCTOR_MASTER_SECRET=dev-secret \
+	PROCTOR_CONSOLE_TOKEN=dev-token \
+	PROCTOR_DB_PATH=proctor.db \
 	.venv/bin/uvicorn proctor_gateway.app:app --reload --port 8000
 
 sim:

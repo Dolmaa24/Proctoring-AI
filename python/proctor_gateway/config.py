@@ -48,6 +48,25 @@ class Settings:
 
     policy_path: str | None = None
 
+    db_path: str = ":memory:"
+    """Where durable state lives. `:memory:` disables persistence entirely.
+
+    Defaults to ephemeral so constructing `Settings` directly — as the test
+    suite does — never touches the filesystem. `from_env` defaults to a real
+    file, because a gateway that forgets `last_seq` on restart lets a client
+    replay its whole earlier stream.
+    """
+
+    retention_days: int = 30
+    """How long violations and finished sessions are kept.
+
+    Evidence rows are observations about identifiable people derived from
+    their faces. Keeping them past the point they are needed for review
+    turns a proctoring system into a biometric archive, so retention is a
+    first-class setting rather than a cleanup script someone might run.
+    Institutions with a shorter statutory limit should lower it.
+    """
+
     console_token: str = ""
     """Bearer token required to read the proctor stream.
 
@@ -75,6 +94,8 @@ class Settings:
             master_secret=master,
             policy_path=os.environ.get("PROCTOR_POLICY_PATH"),
             console_token=os.environ.get("PROCTOR_CONSOLE_TOKEN") or secrets.token_urlsafe(24),
+            db_path=os.environ.get("PROCTOR_DB_PATH", "proctor.db"),
+            retention_days=int(os.environ.get("PROCTOR_RETENTION_DAYS", "30")),
         )
 
     @property
