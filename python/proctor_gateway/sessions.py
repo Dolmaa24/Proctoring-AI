@@ -66,7 +66,17 @@ class Session:
     skew_tolerance_ms: int = 2_000
     last_monotonic_ms: int = -1
     breach_counts: dict[str, int] = field(default_factory=dict)
+    signal_counts: dict[str, int] = field(default_factory=dict)
+    """Per-payload-type tally of what this client actually sent.
+
+    Operationally useful on its own — "this candidate's client never sent a
+    single gaze signal" is the shape of a broken camera or a stripped-down
+    client, and neither is visible from the violation stream alone.
+    """
     _breach_last_ms: dict[str, int] = field(default_factory=dict)
+
+    def count_signal(self, payload_type: str) -> None:
+        self.signal_counts[payload_type] = self.signal_counts.get(payload_type, 0) + 1
 
     def should_report_breach(
         self, kind: str, now_ms: int, cooldown_ms: int = BREACH_COOLDOWN_MS

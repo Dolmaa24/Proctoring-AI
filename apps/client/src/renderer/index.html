@@ -2,8 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!-- The import map is inline, so it is admitted by hash rather than by
+         relaxing script-src to 'unsafe-inline'. Recompute the hash if the
+         map changes; scripts/build.mjs verifies it. -->
     <meta http-equiv="Content-Security-Policy"
-          content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; media-src 'self' blob:; style-src 'self' 'unsafe-inline'" />
+          content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-yZl5subzilhGiUP0ndhMl6BovL3XLZ17r0I0Vayd/rg='; media-src 'self' blob:; style-src 'self' 'unsafe-inline'" />
     <title>Exam session</title>
     <style>
       :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
@@ -29,6 +32,16 @@
         decision is made.
       </p>
     </main>
+    <!-- Loaded over file://, where a bare specifier does not resolve. The
+         map keeps the source importing "@mediapipe/tasks-vision" as normal
+         while pointing at the vendored bundle at runtime. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "@mediapipe/tasks-vision": "./models/vision_bundle.mjs"
+        }
+      }
+    </script>
     <script type="module" src="./index.js"></script>
   </body>
 </html>

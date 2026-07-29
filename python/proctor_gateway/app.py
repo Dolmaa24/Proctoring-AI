@@ -120,6 +120,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "attested_build": session.attested_build,
             "integrity_breaches": session.integrity_breaches,
             "breach_counts": session.breach_counts,
+            "signal_counts": session.signal_counts,
         }
 
     @app.websocket("/v1/sessions/{session_id}/telemetry")
@@ -242,6 +243,7 @@ async def _handle_frame(
             return
 
     payload = envelope.payload
+    session.count_signal(payload.type)
     if isinstance(payload, Attestation):
         session.attested_build = payload.client_build
     elif isinstance(payload, Lifecycle) and payload.phase is LifecyclePhase.SESSION_END:

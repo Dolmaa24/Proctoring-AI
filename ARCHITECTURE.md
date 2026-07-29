@@ -230,7 +230,21 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 
 ## 8. Status
 
-Built and tested: protocol, fusion engine, gateway, simulator (55 tests).
+Built and tested: protocol, fusion engine, gateway, simulator, Electron
+client (61 Python + 29 TypeScript tests). The full chain has been run
+end-to-end against a synthetic camera feed in both the face-present and
+no-face cases; see `apps/client/scripts/e2e.mjs`.
+
+One finding from that run is worth recording, because it is the argument
+for doing it at all. The process blacklist matched the substring `parsec`
+to catch the game-streaming app, and on macOS that matches Apple's
+`parsecd` and `parsec-fbf` — CoreParsec, the Spotlight suggestions daemon,
+present on every Mac. **Every macOS candidate would have been flagged for
+running remote-control software and screen sharing.** The unit tests did
+not catch it because they only tested against process names someone had
+thought of. Matching is now by exact basename with OS-vendor paths
+excluded, and a test runs against the real process table of whatever
+machine it is on.
 
 Not built: Electron client and edge inference, SFU and recording, identity
 verification, audio pipeline, proctor console, persistence (everything is

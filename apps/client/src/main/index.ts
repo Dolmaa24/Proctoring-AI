@@ -47,15 +47,32 @@ function createWindow(): BrowserWindow {
   const created = new BrowserWindow({
     width: 1100,
     height: 760,
-    // Not a lockdown claim — see environment.ts. A kiosk window makes it
-    // obvious when the candidate leaves the exam, which is all it is for.
+    // Not a lockdown claim — see environment.ts. A visible exam window
+    // makes it obvious when the candidate leaves, which is all it is for.
     webPreferences: {
-      preload: path.join(dirname, "preload.js"),
+      // `.mjs` because Electron only treats a preload as ESM by extension;
+      // scripts/build.mjs renames tsc's output accordingly.
+      preload: path.join(dirname, "preload.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true,
+      // Sandboxed preloads must be CommonJS, which rules out the ESM
+      // preload above. The boundary that actually matters is preserved:
+      // contextIsolation keeps the page off the preload's scope, and
+      // nodeIntegration:false keeps Node out of the page. The preload
+      // itself exposes exactly one function.
+      sandbox: false,
     },
   });
+  // Renderer console output is invisible from the terminal otherwise, which
+  // makes a failing camera or model load undiagnosable in CI and during an
+  // end-to-end run. Opt-in so a real exam session stays quiet.
+  if (process.env.PROCTOR_DEBUG) {
+    created.webContents.on("console-message", (_event, level, message, line, source) => {
+      const where = source ? `${path.basename(source)}:${line}` : "renderer";
+      console.log(`[renderer:${level}] ${where} ${message}`);
+    });
+  }
+
   created.loadFile(path.join(dirname, "..", "renderer", "index.html"));
   return created;
 }

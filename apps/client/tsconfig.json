@@ -3,7 +3,10 @@
     "target": "ES2023",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // Source imports carry `.ts` extensions so Node's type stripping can
+    // run the tests with no build step; tsc rewrites them to `.js` on emit.
     "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "strict": true,
     "noUncheckedIndexedAccess": false,

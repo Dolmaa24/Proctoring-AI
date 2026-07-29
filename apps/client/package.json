@@ -8,8 +8,13 @@
   "scripts": {
     "test": "node --experimental-strip-types --no-warnings --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
-    "build": "tsc",
+    "vendor": "node scripts/vendor-assets.mjs",
+    "verify-assets": "node scripts/vendor-assets.mjs --verify",
+    "fixture": "node scripts/synthetic-face.mjs",
+    "build": "node scripts/build.mjs",
     "start": "npm run build && electron .",
+    "e2e": "npm run build && node scripts/e2e.mjs --video fixtures/face.y4m",
+    "e2e:absent": "npm run build && node scripts/e2e.mjs",
     "protocol": "python3 ../../tools/generate_ts_protocol.py"
   },
   "dependencies": {

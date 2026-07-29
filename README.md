@@ -61,15 +61,42 @@ websocat ws://localhost:8000/v1/proctor/stream
 | `proctor_gateway` | FastAPI ingest, integrity checks, proctor fan-out |
 | `proctor_sim` | Scripted candidates + six client-tampering modes |
 | `policies/default.yaml` | 16 rules, all flag-only |
-| `apps/client` | Electron main process, signed transport, gaze geometry |
+| `apps/client` | Electron client: MediaPipe inference, signed transport, OS observation |
 
-The client's OS observation, transport and gaze/head-pose maths are built
-and tested. **It has not yet been run end-to-end against a live camera** —
-the MediaPipe model assets are not vendored, so `npm start` will not work
-until they are. Everything that can be tested without a webcam is.
+The full chain has been run end-to-end — camera → MediaPipe → IPC → signed
+WebSocket → gateway → fusion → proctor stream — against a synthetic camera
+feed, in both the face-present and no-face cases.
 
 Not yet built: SFU and recording, identity verification, audio pipeline,
 proctor console, persistence.
+
+## Running the client
+
+```bash
+cd apps/client && npm install && npm run vendor
+```
+
+`npm run vendor` copies the MediaPipe WASM out of `node_modules` and
+downloads the face landmarker model (3.8 MB, from Google's official host),
+recording SHA-256 digests in `models/manifest.json`. The assets are
+bundled rather than fetched at exam time: the client must work on a
+locked-down network, and a model downloaded during an exam is a model
+nobody has attested.
+
+End-to-end, with no webcam and no volunteer:
+
+```bash
+npm run fixture && npm run e2e
+```
+
+That draws a synthetic face into a Y4M video, feeds it to Chromium's fake
+capture device, and asserts the whole chain. `npm run e2e:absent` runs the
+same check with a feed containing no face, which should raise
+`candidate_absent` and nothing else.
+
+The fixture is drawn procedurally rather than being a photograph. A
+proctoring repo should not carry a scraped image of an identifiable person
+as a test fixture, and it does not need to.
 
 ---
 
