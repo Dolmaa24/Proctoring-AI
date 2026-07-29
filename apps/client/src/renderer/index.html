@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; media-src 'self' blob:; style-src 'self' 'unsafe-inline'" />
+    <title>Exam session</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; display: grid; place-items: center; min-height: 100vh; gap: 1rem; }
+      main { display: grid; gap: 1rem; justify-items: center; padding: 2rem; }
+      video { width: 320px; border-radius: 8px; background: #111; transform: scaleX(-1); }
+      #status { font-size: 0.95rem; }
+      #status[data-state="ok"] { color: #1a7f37; }
+      #status[data-state="error"] { color: #b91c1c; font-weight: 600; }
+      .notice { max-width: 46ch; font-size: 0.85rem; opacity: 0.8; line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <!-- Shown to the candidate deliberately. People are entitled to see
+           what is being captured of them while it is happening, and a
+           visible preview also makes a stalled camera immediately obvious. -->
+      <video id="camera" muted playsinline></video>
+      <p id="status">Starting…</p>
+      <p class="notice">
+        Your camera, microphone and screen activity are monitored for the
+        duration of this exam. Flags are reviewed by a person before any
+        decision is made.
+      </p>
+    </main>
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

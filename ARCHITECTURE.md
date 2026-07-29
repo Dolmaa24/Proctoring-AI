@@ -19,14 +19,46 @@ python/
   proctor_fusion/     policy evaluation, temporal filtering  (no I/O)
   proctor_gateway/    FastAPI: ingest, integrity checks, proctor fan-out
   proctor_sim/        headless candidates, honest and hostile
-  tests/              behavioural + adversarial suites
+  tests/              behavioural + adversarial + conformance suites
+apps/client/src/
+  protocol/           generated types + WebCrypto signing
+  main/               Electron main: OS observation, signed transport
+  renderer/           camera, MediaPipe, gaze geometry
 policies/
   default.yaml        exam policy as reviewable data
+tools/
+  generate_ts_protocol.py   Pydantic schema  ->  TypeScript types
+  conformance.ts            TS-signed frames for the Python verifier
 ```
 
-Planned, not yet built: `apps/client` (Electron edge client), `apps/console`
-(proctor dashboard), `services/identity` (ArcFace), `services/audio`
-(VAD → STT → intent), `services/media` (SFU + recording).
+Planned, not yet built: `apps/console` (proctor dashboard),
+`services/identity` (ArcFace), `services/audio` (VAD → STT → intent),
+`services/media` (SFU + recording).
+
+### 1.1 Why the schema is generated
+
+The Python models are the single source of truth; `make protocol` emits
+their TypeScript equivalent, and a test fails if the checked-in file is
+stale. Hand-maintaining both sides produces a specific, expensive bug:
+someone adds a field in Python, the client never sends it, and nothing
+errors anywhere — the signal simply never arrives, and it surfaces months
+later as "why does this rule never fire".
+
+`python/tests/test_conformance.py` closes the other half. It runs the real
+TypeScript signing code and feeds its output to the real Python verifier,
+covering every payload type, awkward floats and non-ASCII strings.
+
+### 1.2 Process boundary inside the client
+
+The session key, the sequence counter and the socket live in the Electron
+**main** process. The renderer holds the camera and the models and can only
+hand observations inward across a one-function IPC bridge.
+
+This matters because the renderer is a browser context, and anyone who
+opens DevTools has a JavaScript console inside it. With the key there,
+forging telemetry is a paste; with it in main, an attacker has to modify
+the packaged binary. Main also refuses `signal.environment` from the
+renderer — a compromised page must not be able to claim a clean machine.
 
 ---
 

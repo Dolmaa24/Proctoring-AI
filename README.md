@@ -61,9 +61,15 @@ websocat ws://localhost:8000/v1/proctor/stream
 | `proctor_gateway` | FastAPI ingest, integrity checks, proctor fan-out |
 | `proctor_sim` | Scripted candidates + six client-tampering modes |
 | `policies/default.yaml` | 16 rules, all flag-only |
+| `apps/client` | Electron main process, signed transport, gaze geometry |
 
-Not yet built: Electron client and edge inference, SFU and recording,
-identity verification, audio pipeline, proctor console, persistence.
+The client's OS observation, transport and gaze/head-pose maths are built
+and tested. **It has not yet been run end-to-end against a live camera** —
+the MediaPipe model assets are not vendored, so `npm start` will not work
+until they are. Everything that can be tested without a webcam is.
+
+Not yet built: SFU and recording, identity verification, audio pipeline,
+proctor console, persistence.
 
 ---
 
@@ -86,19 +92,25 @@ detection, muttering while thinking, a bad webcam.
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest python/tests -q
+make test
 ```
 
-The suite has two halves, and the second is the interesting one:
+Python (61) and TypeScript (23). The suite has three parts, and the last
+two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest
   candidates, including *not* flagging the honest ones.
 - **Adversarial** — does the transport notice a hostile client. Forged
   signatures, replayed frames, dropped windows, stalled sequences, rewound
-  clocks, and going silent mid-exam.
+  clocks, quitting the app, and going silent mid-exam.
+- **Conformance** — the real TypeScript signing code, verified by the real
+  Python verifier, across every payload type. This is the only thing that
+  would catch the two halves of the protocol drifting apart.
 
 Scenarios are pure data (`proctor_sim/scenarios.py`), so a 15-second exam
-runs in milliseconds with an injected clock.
+runs in milliseconds with an injected clock. The client's geometry and
+process matching are pure functions for the same reason — no webcam, no
+Electron, no volunteer.
 
 ---
 

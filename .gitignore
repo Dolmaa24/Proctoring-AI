@@ -19,3 +19,7 @@ evidence/
 *.mp4
 
 .DS_Store
+
+# Vendored MediaPipe model assets (large binaries, fetched at build time)
+apps/client/src/renderer/models/
+apps/client/dist/

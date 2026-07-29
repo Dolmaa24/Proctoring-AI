@@ -1,14 +1,27 @@
-.PHONY: install test lint dev sim clean
+.PHONY: install test test-py test-ts lint dev sim protocol clean
 
 PY := .venv/bin/python
+NODE_TEST := node --experimental-strip-types --no-warnings --test
 
 install:
 	python3 -m venv .venv
 	.venv/bin/pip install -q --upgrade pip
 	.venv/bin/pip install -q -e ".[dev]"
+	cd apps/client && npm install --no-audit --no-fund
 
-test:
+test: test-py test-ts
+
+test-py:
 	$(PY) -m pytest python/tests -q
+
+# No build step: Node 22 strips the types directly.
+test-ts:
+	cd apps/client && $(NODE_TEST) 'src/**/*.test.ts'
+
+# Regenerate the TypeScript event types from the Pydantic schema.
+# `make test-py` fails if this is stale.
+protocol:
+	$(PY) tools/generate_ts_protocol.py
 
 lint:
 	.venv/bin/ruff check python

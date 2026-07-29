@@ -1,0 +1,28 @@
+{
+  "name": "@proctor/client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron edge client: local inference, signed telemetry, OS observation",
+  "type": "module",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings --test 'src/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "start": "npm run build && electron .",
+    "protocol": "python3 ../../tools/generate_ts_protocol.py"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.18",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "electron": "^33.2.0",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
