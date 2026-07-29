@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+node_modules/
+.env
+.env.local
+
+# Session recordings and captured evidence must never reach the repo:
+# they are biometric data belonging to real candidates.
+recordings/
+evidence/
+*.webm
+*.mp4
+
+.DS_Store

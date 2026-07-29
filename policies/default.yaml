@@ -1,0 +1,208 @@
+# Default exam policy.
+#
+# Every threshold in this file is a product decision with a human cost, not
+# a tuning constant. Loosening `onset_ms` produces more flags, and every
+# false flag is a real person accused of cheating on the strength of a
+# webcam. The defaults here are deliberately conservative.
+#
+# Nothing in this policy terminates an exam. `action: flag` means a human
+# reviews it. See rules.py::AutomatedAction for why that is the default.
+
+name: default-v1
+
+rules:
+  # -- Gaze -----------------------------------------------------------------
+  - id: gaze_off_screen
+    description: Candidate's gaze left the screen area.
+    signal: signal.gaze
+    when: { field: on_screen, op: "==", value: false }
+    severity: soft
+    # 2.5s continuous. Below about 1.5s this fires on people re-reading a
+    # question, glancing at a noise, or resting their eyes.
+    onset_ms: 2500
+    # A blink is 100-400ms and drops iris tracking. Without this hysteresis
+    # a candidate could blink their way out of every sustained look-away.
+    release_ms: 800
+    cooldown_ms: 15000
+    min_confidence: 0.6
+
+  - id: gaze_extreme_lateral
+    description: Candidate's gaze held far to one side, consistent with reading a second screen.
+    signal: signal.gaze
+    when: { field: yaw_deg, op: "abs>=", value: 35.0 }
+    severity: soft
+    onset_ms: 3000
+    release_ms: 800
+    cooldown_ms: 20000
+    min_confidence: 0.65
+
+  # -- Head pose ------------------------------------------------------------
+  - id: head_turned_away
+    description: Head turned well away from the screen.
+    signal: signal.head_pose
+    when: { field: yaw_deg, op: "abs>=", value: 40.0 }
+    severity: soft
+    onset_ms: 3000
+    release_ms: 1000
+    cooldown_ms: 20000
+    min_confidence: 0.6
+
+  - id: head_down_sustained
+    description: Head angled down for a sustained period, consistent with looking at a lap or desk.
+    signal: signal.head_pose
+    when: { field: pitch_deg, op: ">=", value: 35.0 }
+    severity: soft
+    # Longer than the lateral rules on purpose: candidates legitimately look
+    # down at scratch paper, keyboards, and their own hands.
+    onset_ms: 5000
+    release_ms: 1200
+    cooldown_ms: 25000
+    min_confidence: 0.6
+
+  # -- Face presence --------------------------------------------------------
+  - id: candidate_absent
+    description: No face visible; candidate may have left the camera view.
+    signal: signal.face
+    when: { field: face_count, op: "==", value: 0 }
+    severity: hard
+    onset_ms: 4000
+    release_ms: 1000
+    cooldown_ms: 20000
+    min_confidence: 0.5
+
+  - id: multiple_faces
+    description: More than one face visible in frame.
+    signal: signal.face
+    when: { field: face_count, op: ">", value: 1 }
+    severity: hard
+    # 2s rather than instant: a family member walking behind the candidate
+    # is common, and the detector also double-counts on some reflections.
+    onset_ms: 2000
+    release_ms: 1000
+    cooldown_ms: 20000
+    min_confidence: 0.7
+
+  - id: poor_capture_conditions
+    description: Face detection confidence persistently low; session may not be reviewable.
+    signal: signal.face
+    when: { field: confidence, op: "<", value: 0.45 }
+    severity: info
+    onset_ms: 10000
+    release_ms: 3000
+    cooldown_ms: 60000
+    # Evaluated on every sample regardless of confidence, because low
+    # confidence is precisely what this rule is looking for.
+    min_confidence: 0.0
+    requires_human_review: false
+
+  # -- Objects --------------------------------------------------------------
+  - id: phone_detected
+    description: A mobile phone was detected in frame.
+    signal: signal.object
+    when:
+      all_of:
+        - { field: label, op: "==", value: phone }
+        - { field: confidence, op: ">=", value: 0.7 }
+    severity: hard
+    # 800ms confirmation window. A single-frame detector false positive must
+    # never be enough to accuse someone.
+    onset_ms: 800
+    release_ms: 1500
+    cooldown_ms: 20000
+    min_confidence: 0.7
+
+  - id: second_person_detected
+    description: A second person was detected in frame.
+    signal: signal.object
+    when:
+      all_of:
+        - { field: label, op: "==", value: person }
+        - { field: confidence, op: ">=", value: 0.75 }
+    severity: hard
+    onset_ms: 2000
+    release_ms: 1500
+    cooldown_ms: 20000
+    min_confidence: 0.75
+
+  - id: wearable_detected
+    description: A smartwatch or headphones were detected.
+    signal: signal.object
+    when:
+      all_of:
+        - { field: label, op: "in", value: [smartwatch, headphones] }
+        - { field: confidence, op: ">=", value: 0.7 }
+    severity: soft
+    onset_ms: 1500
+    release_ms: 1500
+    cooldown_ms: 30000
+    min_confidence: 0.7
+
+  # -- Liveness / spoofing --------------------------------------------------
+  - id: spoof_suspected
+    description: Face appears to be a photograph or a screen rather than a live person.
+    signal: signal.liveness
+    when: { field: score, op: "<", value: 0.35 }
+    severity: hard
+    onset_ms: 2000
+    release_ms: 2000
+    cooldown_ms: 30000
+    min_confidence: 0.7
+
+  # -- Audio ----------------------------------------------------------------
+  - id: sustained_speech
+    description: Sustained speech detected; audio routed for transcription and review.
+    signal: signal.audio
+    when: { field: speech_active, op: "==", value: true }
+    severity: soft
+    # 4s. Muttering while thinking is extremely common and is not cheating;
+    # this threshold is about catching conversation, not vocalisation.
+    onset_ms: 4000
+    release_ms: 1500
+    cooldown_ms: 20000
+    min_confidence: 0.6
+
+  # -- OS environment -------------------------------------------------------
+  - id: exam_window_unfocused
+    description: The exam window lost focus.
+    signal: signal.environment
+    when: { field: window_focused, op: "==", value: false }
+    severity: hard
+    onset_ms: 1000
+    release_ms: 500
+    cooldown_ms: 10000
+
+  - id: multiple_monitors
+    description: More than one display is attached.
+    signal: signal.environment
+    when: { field: monitor_count, op: ">", value: 1 }
+    severity: hard
+    onset_ms: 1000
+    release_ms: 1000
+    cooldown_ms: 60000
+
+  - id: blacklisted_process
+    description: A screen-sharing or remote-control process is running.
+    signal: signal.environment
+    when: { field: blacklisted_processes, op: "!=", value: [] }
+    severity: hard
+    onset_ms: 1000
+    release_ms: 1000
+    cooldown_ms: 60000
+
+  - id: screen_share_active
+    description: An active screen share was detected.
+    signal: signal.environment
+    when: { field: screen_share_active, op: "==", value: true }
+    severity: hard
+    onset_ms: 1000
+    release_ms: 1000
+    cooldown_ms: 30000
+
+# Absence-of-data rule. Evaluated on a wall-clock tick, not on receipt of an
+# event, so that a client which simply stops reporting still trips it.
+liveness:
+  id: stream_silent
+  description: Telemetry stream went quiet; the client may have been suppressed or crashed.
+  max_gap_ms: 5000
+  severity: hard
+  cooldown_ms: 30000
