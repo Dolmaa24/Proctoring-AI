@@ -460,12 +460,12 @@ else spoken near an open microphone.
   long as it still exists — once purged, that endpoint 404s like any other
   expired record, and the flag survives without the words.
 
-**Known gap:** the proctor console does not currently render violation
-evidence for *any* rule — fusion, identity, or audio. A `transcript_ref` in
-a flag's evidence is reachable via the API today but not yet through the
-UI. This predates the audio pipeline (identity's similarity scores have
-the same gap) and is worth closing before either feature is relied on for
-real review; it is a console data-model change, not an audio-specific one.
+**Closed.** The console now renders evidence for every rule — fusion,
+identity, and audio — via the same mechanism: `TimelineEntry.evidence_count`
+in the board snapshot, and `GET /v1/proctor/sessions/{id}/violations/{id}`
+fetched lazily when a proctor opens a specific flag. Audio's
+`transcript_ref` is dereferenced the same way, one click further in, via the
+existing transcript endpoint — see § 5.5.8.
 
 ### 5.5.5 Whisper is not bundled, but not because of its licence
 
@@ -504,6 +504,37 @@ identity endpoints had this latent issue already; it is fixed here rather
 than left for audio alone to get right, since leaving it asymmetric while
 noticing it would be negligent.
 
+### 5.5.8 Rendering evidence in the console
+
+The board snapshot (`GET /v1/proctor/sessions`) never carries raw evidence
+— `TimelineEntry` carries `evidence_count` only, an integer. This is not an
+oversight; it is sized deliberately against how the console actually
+polls. `console.js` refetches the *entire* board on every WebSocket
+message it receives, by design (a comment there explains why: scoring and
+ordering stay server-side, so the client re-reads rather than
+reimplementing decay logic that would drift). Embedding up to 64 evidence
+samples per flag, per session, in every one of those refetches would make
+an ordinary exam room's traffic pattern expensive for no benefit — a
+proctor is not reading raw signal samples for every flag in the queue at
+once.
+
+Full evidence is one click away instead:
+`GET /v1/proctor/sessions/{session_id}/violations/{violation_id}` returns
+the complete stored record — evidence array, message, severity — for the
+one violation a proctor actually opens. `store.load_violation` returns the
+*firing* row rather than a later resolution row for the same
+`violation_id`: the fusion engine reuses the id across both, and the
+resolution row carries no evidence (`evidence=()`), so naively taking the
+latest row for an id would silently show nothing for a resolved flag.
+
+Audio's evidence carries a `transcript_ref` rather than the words
+themselves (§ 5.5.4); the console dereferences it one level further, via
+the existing `GET .../audio/transcripts/{transcript_id}` endpoint, cached
+client-side and rendered inline once fetched. If the transcript has since
+been purged, that endpoint 404s and the console shows exactly that rather
+than failing silently — the flag and its labels survive independently of
+whether the words still exist.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -540,8 +571,9 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 ## 8. Status
 
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
-client, proctor console, persistence, identity verification, audio pipeline
-(197 Python + 29 TypeScript tests). The full chain has been run
+client, proctor console (including on-demand violation evidence and
+transcript rendering, § 5.5.8), persistence, identity verification, audio
+pipeline (204 Python + 29 TypeScript tests). The full chain has been run
 end-to-end against a synthetic camera feed in both the face-present and
 no-face cases; see `apps/client/scripts/e2e.mjs`.
 

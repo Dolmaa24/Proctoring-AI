@@ -192,6 +192,42 @@ main {
 .msg { font-size: 0.8rem; }
 .dur { font-family: var(--mono); font-size: 0.72rem; color: var(--ink-soft); }
 
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-left: 0.35rem;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.link-btn:hover { color: var(--ink); }
+
+/* A plain sibling <li> in the (non-grid) timeline list, not a grid item of
+   .entry — the indent below just visually lines it up with .entry's msg column. */
+.entry-evidence { padding: 0 0 0.6rem; border-bottom: 1px solid var(--line); }
+
+.evidence { font-size: 0.75rem; padding: 0.4rem 0 0.2rem 5.5rem; color: var(--ink-soft); }
+.evidence-error { color: var(--review); }
+.evidence-list { list-style: none; margin: 0.3rem 0 0; padding: 0; display: grid; gap: 0.25rem; }
+.evidence-list .at { min-width: 5.5rem; display: inline-block; }
+.evidence-list .fields { font-family: var(--mono); color: var(--ink); }
+
+.transcript-box {
+  margin-top: 0.3rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+}
+
 .empty { padding: 1.5rem; color: var(--ink-soft); font-size: 0.85rem; }
 
 dialog {

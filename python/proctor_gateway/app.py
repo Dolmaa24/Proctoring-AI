@@ -687,6 +687,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return record
 
+    @app.get("/v1/proctor/sessions/{session_id}/violations/{violation_id}")
+    async def violation_evidence(
+        session_id: str,
+        violation_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """The measurements behind one flag, fetched on demand.
+
+        Deliberately not embedded in the board snapshot — see
+        `TimelineEntry.evidence_count`. This is the one place a proctor
+        actually needs the raw samples: after opening a specific flag to
+        decide whether it warrants review, not while scanning the queue.
+        """
+        _require_console_token(settings, _bearer(authorization))
+        record = store.load_violation(violation_id)
+        if record is None or record["session_id"] != session_id:
+            raise HTTPException(status_code=404, detail="violation not found")
+        return record
+
     @app.get("/v1/proctor/sessions")
     async def proctor_sessions(authorization: str | None = Header(default=None)):
         _require_console_token(settings, _bearer(authorization))

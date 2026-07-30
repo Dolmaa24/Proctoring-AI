@@ -125,10 +125,15 @@ they're excluded here because the dependency (torch or ctranslate2) is
 hundreds of megabytes for a feature that ships off by default. Point
 `PROCTOR_AUDIO_MODEL` at your own downloaded model.
 
-**Known gap:** the proctor console does not yet render violation evidence
-for any rule — the numbers behind a flag (similarity scores, a transcript
-reference) are reachable via the API but not the UI. Worth closing before
-either identity or audio findings are relied on for real review.
+The console renders evidence for every rule — fusion, identity, and audio
+— on demand: the board snapshot carries only a sample count per flag
+(embedding the full samples in a payload that's refetched on every
+WebSocket message would be wasteful at exam-room scale), and opening a
+flag fetches `GET /v1/proctor/sessions/{id}/violations/{id}` for the full
+record. Audio's evidence carries a `transcript_ref` rather than the words
+themselves; the console dereferences that one level further, and shows
+"no longer available" once it's past retention rather than failing
+silently.
 
 Not yet built: SFU and recording, client-side microphone capture/VAD, ID
 document capture.
@@ -185,7 +190,7 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (197) and TypeScript (29). The suite has three parts, and the last
+Python (204) and TypeScript (29). The suite has three parts, and the last
 two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest

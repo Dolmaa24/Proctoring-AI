@@ -10,6 +10,14 @@
  * displayed. It is used for ordering only, and the coarse band is what a
  * human sees. A number beside a person's name gets read as a confidence
  * value no matter how it is labelled.
+ *
+ * Evidence (the raw signal samples, similarity scores, or a transcript
+ * reference behind a flag) is fetched lazily, one violation at a time, only
+ * when a proctor opens it — never embedded in the board snapshot. See
+ * TimelineEntry.evidence_count in proctor_gateway/triage.py for why: that
+ * snapshot is refetched in full on every WS message this file receives, and
+ * embedding up to 64 samples per flag in every one of those refetches would
+ * make an ordinary exam room's traffic pattern expensive for no benefit.
  */
 
 const els = {
@@ -30,7 +38,18 @@ const state = {
   sessions: new Map(),
   selected: null,
   token: sessionStorage.getItem("proctor.token") ?? "",
+  // Evidence and transcripts are fetched lazily, per entry a proctor
+  // actually opens — see TimelineEntry.evidence_count in triage.py for
+  // why the board snapshot itself never carries the raw samples. Cached
+  // client-side and keyed by session so re-selecting a session does not
+  // refetch, and `expanded` persists across the frequent snapshot
+  // refetches this file already does on every WS message.
+  evidenceCache: new Map(),
+  transcriptCache: new Map(),
+  expanded: new Set(),
 };
+
+const EVIDENCE_DISPLAY_LIMIT = 20;
 
 const clockTime = (ms) =>
   new Date(ms).toLocaleTimeString(undefined, {
@@ -44,6 +63,124 @@ const duration = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`)
 function setLink(stateName, label) {
   els.link.dataset.state = stateName;
   els.link.textContent = label;
+}
+
+function formatValue(value) {
+  if (Array.isArray(value) || (value && typeof value === "object")) return JSON.stringify(value);
+  return String(value);
+}
+
+const cacheKey = (sessionId, id) => `${sessionId}::${id}`;
+
+// -- evidence and transcripts (fetched on demand) ----------------------------
+
+async function fetchJson(url, cache, key) {
+  if (cache.has(key)) return cache.get(key);
+  let result;
+  try {
+    const response = await fetch(url, { headers: { authorization: `Bearer ${state.token}` } });
+    result = response.ok ? await response.json() : { error: `unavailable (${response.status})` };
+  } catch {
+    result = { error: "network error" };
+  }
+  cache.set(key, result);
+  return result;
+}
+
+async function toggleEvidence(sessionId, violationId) {
+  if (state.expanded.has(violationId)) {
+    state.expanded.delete(violationId);
+  } else {
+    state.expanded.add(violationId);
+    await fetchJson(
+      `/v1/proctor/sessions/${sessionId}/violations/${violationId}`,
+      state.evidenceCache,
+      cacheKey(sessionId, violationId),
+    );
+  }
+  renderDetail();
+}
+
+async function toggleTranscript(sessionId, transcriptId) {
+  const key = `transcript:${transcriptId}`;
+  if (state.expanded.has(key)) {
+    state.expanded.delete(key);
+  } else {
+    state.expanded.add(key);
+    await fetchJson(
+      `/v1/proctor/sessions/${sessionId}/audio/transcripts/${transcriptId}`,
+      state.transcriptCache,
+      cacheKey(sessionId, transcriptId),
+    );
+  }
+  renderDetail();
+}
+
+function renderEvidence(sessionId, record) {
+  const wrap = document.createElement("div");
+  wrap.className = "evidence";
+
+  if (record.error) {
+    wrap.classList.add("evidence-error");
+    wrap.textContent = record.error;
+    return wrap;
+  }
+
+  const items = record.evidence ?? [];
+  const shown = items.slice(-EVIDENCE_DISPLAY_LIMIT);
+  if (items.length > shown.length) {
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = `showing the most recent ${shown.length} of ${items.length} samples`;
+    wrap.append(note);
+  }
+  if (!items.length) {
+    wrap.append(document.createTextNode("no samples recorded"));
+    return wrap;
+  }
+
+  const list = document.createElement("ol");
+  list.className = "evidence-list";
+  for (const item of shown) {
+    const li = document.createElement("li");
+
+    const at = document.createElement("span");
+    at.className = "at";
+    at.textContent = clockTime(item.server_ts_ms);
+
+    const fields = document.createElement("span");
+    fields.className = "fields";
+    fields.textContent = Object.entries(item.payload ?? {})
+      .map(([field, value]) => `${field}=${formatValue(value)}`)
+      .join("  ");
+
+    li.append(at, fields);
+
+    // Audio findings reference a transcript rather than embedding it — see
+    // _audio_violation in proctor_gateway/app.py. This is the other end of
+    // that split: dereference it here, on request, while it still exists.
+    const transcriptRef = item.payload?.transcript_ref;
+    if (transcriptRef) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "link-btn";
+      btn.textContent = "view transcript";
+      btn.addEventListener("click", () => toggleTranscript(sessionId, transcriptRef));
+      li.append(document.createTextNode(" "), btn);
+
+      if (state.expanded.has(`transcript:${transcriptRef}`)) {
+        const cached = state.transcriptCache.get(cacheKey(sessionId, transcriptRef));
+        const box = document.createElement("div");
+        box.className = "transcript-box";
+        box.textContent = cached ? (cached.error ?? cached.transcript) : "loading…";
+        li.append(box);
+      }
+    }
+
+    list.append(li);
+  }
+  wrap.append(list);
+  return wrap;
 }
 
 // -- rendering --------------------------------------------------------------
@@ -126,7 +263,7 @@ function renderDetail() {
 
   const entries = session.timeline ?? [];
   els.timeline.replaceChildren(
-    ...entries.map((entry) => {
+    ...entries.flatMap((entry) => {
       const li = document.createElement("li");
       li.className = "entry";
       li.dataset.severity = entry.severity;
@@ -142,7 +279,7 @@ function renderDetail() {
 
       const msg = document.createElement("span");
       msg.className = "msg";
-      msg.textContent = entry.resolved ? `${entry.message}` : entry.message;
+      msg.textContent = entry.message;
       if (entry.duration_ms) {
         const dur = document.createElement("span");
         dur.className = "dur";
@@ -150,8 +287,29 @@ function renderDetail() {
         msg.append(dur);
       }
 
+      const isOpen = state.expanded.has(entry.violation_id);
+      if (entry.evidence_count > 0) {
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "link-btn";
+        toggle.setAttribute("aria-expanded", String(isOpen));
+        const noun = entry.evidence_count === 1 ? "sample" : "samples";
+        toggle.textContent = `${entry.evidence_count} ${noun} ${isOpen ? "▾" : "▸"}`;
+        toggle.addEventListener("click", () => toggleEvidence(session.session_id, entry.violation_id));
+        msg.append(document.createTextNode(" "), toggle);
+      }
+
       li.append(at, rule, msg);
-      return li;
+
+      if (entry.evidence_count === 0 || !isOpen) return [li];
+
+      const record = state.evidenceCache.get(cacheKey(session.session_id, entry.violation_id));
+      const evidenceRow = document.createElement("li");
+      evidenceRow.className = "entry-evidence";
+      evidenceRow.append(
+        record ? renderEvidence(session.session_id, record) : document.createTextNode("loading…"),
+      );
+      return [li, evidenceRow];
     }),
   );
 

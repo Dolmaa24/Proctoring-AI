@@ -210,6 +210,123 @@ def test_flagged_violations_carry_evidence(client, clock):
     )
 
 
+# -- console evidence lookup -------------------------------------------------
+#
+# The board snapshot never carries raw evidence (see triage.TimelineEntry) —
+# only a count. These tests exercise the dedicated per-violation endpoint
+# the console calls when a proctor actually opens a flag.
+
+
+def test_board_snapshot_carries_a_count_not_the_samples(clock, tmp_path):
+    settings = Settings(
+        master_secret=MASTER,
+        clock=clock,
+        console_token=CONSOLE_TOKEN,
+        db_path=str(tmp_path / "evidence.db"),
+    )
+    with TestClient(create_app(settings)) as client:
+        run_scenario_settings(client, clock, "phone")
+        board = client.get(
+            "/v1/proctor/sessions", headers={"authorization": f"Bearer {CONSOLE_TOKEN}"}
+        ).json()["sessions"]
+
+    entry = next(e for e in board[0]["timeline"] if e["rule_id"] == "phone_detected")
+    assert entry["evidence_count"] > 0
+    assert "evidence" not in entry, "raw samples must not ride along in the snapshot"
+
+
+def test_violation_evidence_is_fetchable_by_reference(clock, tmp_path):
+    settings = Settings(
+        master_secret=MASTER,
+        clock=clock,
+        console_token=CONSOLE_TOKEN,
+        db_path=str(tmp_path / "evidence2.db"),
+    )
+    with TestClient(create_app(settings)) as client:
+        session_id = run_scenario_settings(client, clock, "phone")
+        board = client.get(
+            "/v1/proctor/sessions", headers={"authorization": f"Bearer {CONSOLE_TOKEN}"}
+        ).json()["sessions"]
+        entry = next(e for e in board[0]["timeline"] if e["rule_id"] == "phone_detected")
+
+        response = client.get(
+            f"/v1/proctor/sessions/{session_id}/violations/{entry['violation_id']}",
+            headers={"authorization": f"Bearer {CONSOLE_TOKEN}"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["evidence"]) == entry["evidence_count"], (
+        "the count in the snapshot must match the full record's actual length"
+    )
+    # Evidence is the session's whole recent-signal window, not filtered to
+    # the firing rule's own signal type — see FusionEngine.on_event — so
+    # this checks shape rather than assuming which signal comes first.
+    assert all("type" in item["payload"] for item in body["evidence"])
+    assert any(item["payload"]["type"] == "signal.object" for item in body["evidence"]), (
+        "the phone detection itself must be somewhere in the window"
+    )
+
+
+def test_violation_evidence_requires_the_console_token(clock, tmp_path):
+    settings = Settings(
+        master_secret=MASTER,
+        clock=clock,
+        console_token=CONSOLE_TOKEN,
+        db_path=str(tmp_path / "evidence3.db"),
+    )
+    with TestClient(create_app(settings)) as client:
+        session_id = run_scenario_settings(client, clock, "phone")
+        response = client.get(f"/v1/proctor/sessions/{session_id}/violations/whatever")
+    assert response.status_code == 401
+
+
+def test_unknown_violation_id_is_404(client, clock):
+    session_id, _ = enrol(client)
+    response = client.get(
+        f"/v1/proctor/sessions/{session_id}/violations/nope",
+        headers={"authorization": f"Bearer {CONSOLE_TOKEN}"},
+    )
+    assert response.status_code == 404
+
+
+def test_a_violation_from_another_session_is_not_returned(clock, tmp_path):
+    """The session_id in the path is a real check, not decoration."""
+    settings = Settings(
+        master_secret=MASTER,
+        clock=clock,
+        console_token=CONSOLE_TOKEN,
+        db_path=str(tmp_path / "evidence4.db"),
+    )
+    with TestClient(create_app(settings)) as client:
+        run_scenario_settings(client, clock, "phone")
+        board = client.get(
+            "/v1/proctor/sessions", headers={"authorization": f"Bearer {CONSOLE_TOKEN}"}
+        ).json()["sessions"]
+        entry = next(e for e in board[0]["timeline"] if e["rule_id"] == "phone_detected")
+
+        other_session, _ = enrol(client)
+        response = client.get(
+            f"/v1/proctor/sessions/{other_session}/violations/{entry['violation_id']}",
+            headers={"authorization": f"Bearer {CONSOLE_TOKEN}"},
+        )
+    assert response.status_code == 404
+
+
+def run_scenario_settings(client: TestClient, clock: FakeClock, scenario: str) -> str:
+    """Like `run_scenario`, but returns the session_id instead of draining
+    violations off the WS — these tests read the board and store directly."""
+    session_id, key_b64 = enrol(client)
+    sim = SimulatedClient.from_enrolment(session_id, key_b64)
+    script = BEHAVIOURAL[scenario][1]()
+    base = clock.now
+    with client.websocket_connect(f"/v1/sessions/{session_id}/telemetry") as ws:
+        for t_ms, frame in sim.frames(script):
+            clock.now = base + t_ms
+            ws.send_text(frame)
+    return session_id
+
+
 # -- adversarial: a hostile client ------------------------------------------
 
 

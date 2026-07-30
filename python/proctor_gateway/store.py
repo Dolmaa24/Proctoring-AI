@@ -178,6 +178,7 @@ class Store(Protocol):
     def save_session(self, record: SessionRecord, now_ms: int) -> None: ...
     def append_violation(self, violation: dict[str, Any], now_ms: int) -> None: ...
     def load_violations(self, per_session: int) -> dict[str, list[dict[str, Any]]]: ...
+    def load_violation(self, violation_id: str) -> dict[str, Any] | None: ...
     def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]: ...
     def save_template(
         self,
@@ -238,6 +239,9 @@ class MemoryStore:
     def load_violations(self, per_session: int) -> dict[str, list[dict[str, Any]]]:
         return {}
 
+    def load_violation(self, violation_id: str) -> dict[str, Any] | None:
+        return None
+
     def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]:
         return (0, 0)
 
@@ -297,6 +301,26 @@ class MemoryStore:
 
     def close(self) -> None:
         return None
+
+
+def _violation_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Shared between `load_violations` (bulk, per session) and
+    `load_violation` (single, by id) so the two cannot drift in shape —
+    the console's evidence view depends on both returning the same fields.
+    """
+    return {
+        "session_id": row["session_id"],
+        "violation_id": row["violation_id"],
+        "rule_id": row["rule_id"],
+        "severity": row["severity"],
+        "message": row["message"],
+        "opened_at_ms": row["opened_at_ms"],
+        "fired_at_ms": row["fired_at_ms"],
+        "duration_ms": row["duration_ms"],
+        "resolved": bool(row["resolved"]),
+        "recorded_ms": row["recorded_ms"],
+        "evidence": json.loads(row["evidence"]),
+    }
 
 
 class SqliteStore:
@@ -446,24 +470,23 @@ class SqliteStore:
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            grouped.setdefault(row["session_id"], []).append(
-                {
-                    "session_id": row["session_id"],
-                    "violation_id": row["violation_id"],
-                    "rule_id": row["rule_id"],
-                    "severity": row["severity"],
-                    "message": row["message"],
-                    "opened_at_ms": row["opened_at_ms"],
-                    "fired_at_ms": row["fired_at_ms"],
-                    "duration_ms": row["duration_ms"],
-                    "resolved": bool(row["resolved"]),
-                    "recorded_ms": row["recorded_ms"],
-                    "evidence": json.loads(row["evidence"]),
-                }
-            )
+            grouped.setdefault(row["session_id"], []).append(_violation_row_to_dict(row))
         return grouped
 
-    # -- retention ---------------------------------------------------------
+    def load_violation(self, violation_id: str) -> dict[str, Any] | None:
+        """The earliest stored row for one violation_id — the firing event.
+
+        A violation's id is reused for its later resolution row, which
+        carries no evidence (`evidence=()` in the fusion engine). Ordering
+        by `id ASC` and taking the first match returns the row a reviewer
+        actually wants: the measurements that caused the flag to fire.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM violations WHERE violation_id = ? ORDER BY id ASC LIMIT 1",
+                (violation_id,),
+            ).fetchone()
+        return _violation_row_to_dict(row) if row is not None else None
 
     # -- identity ----------------------------------------------------------
 

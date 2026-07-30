@@ -308,6 +308,55 @@ def test_violations_are_capped_per_session_on_load(tmp_path):
     assert loaded[-1]["violation_id"] == "v499"
 
 
+def test_load_violation_returns_the_firing_row_not_the_resolution(tmp_path):
+    """A violation_id is reused for its resolution event, which carries no
+    evidence. The lookup must prefer the row a reviewer actually wants."""
+    store = SqliteStore(str(tmp_path / "single.db"))
+    store.append_violation(
+        {
+            "session_id": "sess-x",
+            "violation_id": "v1",
+            "rule_id": "gaze_off_screen",
+            "severity": "soft",
+            "message": "fired",
+            "duration_ms": 2500,
+            "resolved": False,
+            "evidence": [
+                {"server_ts_ms": 1, "client_ts_ms": 1, "seq": 0, "payload": {"yaw_deg": -40}}
+            ],
+        },
+        now_ms=100,
+    )
+    store.append_violation(
+        {
+            "session_id": "sess-x",
+            "violation_id": "v1",
+            "rule_id": "gaze_off_screen",
+            "severity": "soft",
+            "message": "resolved",
+            "duration_ms": 2500,
+            "resolved": True,
+            "evidence": [],
+        },
+        now_ms=200,
+    )
+
+    record = store.load_violation("v1")
+    store.close()
+
+    assert record is not None
+    assert record["message"] == "fired"
+    assert record["evidence"], (
+        "the firing row's evidence must be returned, not the empty resolution row"
+    )
+
+
+def test_load_violation_returns_none_for_an_unknown_id(tmp_path):
+    store = SqliteStore(str(tmp_path / "none.db"))
+    assert store.load_violation("nope") is None
+    store.close()
+
+
 def test_unknown_session_is_not_resurrected_by_restore(db_path):
     clock = FakeClock()
     with build(db_path, clock) as client:

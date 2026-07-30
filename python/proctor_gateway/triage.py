@@ -76,6 +76,20 @@ class TimelineEntry:
     duration_ms: int
     violation_id: str
     resolved: bool = False
+    evidence_count: int = 0
+    """How many evidence samples the fired violation carried.
+
+    Deliberately a count, not the evidence itself. The board snapshot is
+    refetched in full on every WS message the console receives — see
+    console.js's comment on why scoring stays server-side and snapshots
+    stay simple — so embedding up to 64 evidence samples per entry, per
+    session, on every one of those refetches would make an ordinary exam
+    room's traffic pattern expensive for no benefit: a proctor is not
+    reading raw signal samples for every flag in the queue at once. Full
+    evidence is one `violation_id` away via
+    `GET /v1/proctor/sessions/{id}/violations/{violation_id}`, fetched only
+    for the entry a human actually opens.
+    """
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +100,7 @@ class TimelineEntry:
             "duration_ms": self.duration_ms,
             "violation_id": self.violation_id,
             "resolved": self.resolved,
+            "evidence_count": self.evidence_count,
         }
 
 
@@ -132,6 +147,7 @@ class SessionTriage:
             duration_ms=violation.get("duration_ms", 0),
             violation_id=violation["violation_id"],
             resolved=bool(violation.get("resolved")),
+            evidence_count=len(violation.get("evidence") or ()),
         )
 
         if entry.resolved:
