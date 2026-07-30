@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -42,6 +42,18 @@ from proctor_identity import (
     build_enrolment,
     load_embedder,
 )
+from proctor_media import (
+    FakeRoomProvider,
+    InvalidTransition,
+    LiveKitRoomProvider,
+    RecordingRecord,
+    RecordingStatus,
+    RoomProvider,
+    RoomProviderError,
+    TokenError,
+    verify_webhook,
+)
+from proctor_media.tokens import LiveKitCredentials
 from proctor_protocol import (
     Attestation,
     Lifecycle,
@@ -261,6 +273,22 @@ class AudioChunkRequest(BaseModel):
     exam_subject: str = ""
 
 
+def _build_media_provider(settings: Settings) -> RoomProvider:
+    """Real LiveKit provider when configured, otherwise the fake.
+
+    Constructed regardless of `media_enabled` — same as the embedder and
+    transcriber — so that the "enabled but backed by a test double" check
+    below has something to compare against, and so flipping the consent
+    gate on does not also require restarting with different provider
+    wiring.
+    """
+    if settings.livekit_url and settings.livekit_api_key and settings.livekit_api_secret:
+        return LiveKitRoomProvider(
+            settings.livekit_url, settings.livekit_api_key, settings.livekit_api_secret
+        )
+    return FakeRoomProvider()
+
+
 class CreateSessionRequest(BaseModel):
     exam_id: str = Field(min_length=1, max_length=128)
     candidate_ref: str = Field(min_length=1, max_length=128)
@@ -305,6 +333,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             seeking_help_required=settings.audio_help_required,
         )
     )
+    media_provider = _build_media_provider(settings)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -316,6 +345,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _purge(store, settings)
         _purge_templates(store, settings)
         _purge_transcripts(store, settings)
+        _purge_recordings(store, settings)
         restored = _restore(store, registry, board, engine, settings)
         if verifier is not None:
             _restore_templates(store, verifier, embedder)
@@ -335,6 +365,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "the audio pipeline is enabled but PROCTOR_AUDIO_MODEL is unset; "
                 "using a test double that does NOT transcribe real audio. This "
                 "must not run in production."
+            )
+        if settings.media_enabled and isinstance(media_provider, FakeRoomProvider):
+            log.warning(
+                "media/recording is enabled but PROCTOR_LIVEKIT_URL is unset; "
+                "using a fake provider with no real SFU behind it. This must not "
+                "run in production."
             )
         ticker = asyncio.create_task(_tick_loop(engine, broadcast, settings))
         log.info("gateway up: policy=%s rules=%d", policy.name, len(policy.rules))
@@ -706,6 +742,159 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="violation not found")
         return record
 
+    @app.get("/v1/sessions/{session_id}/media/config")
+    async def media_config(session_id: str) -> dict[str, Any]:
+        """Whether the client should bother connecting at all, and where.
+
+        Never returns the API key or secret — only the connection URL, so
+        a compromised renderer learns nothing that helps it mint its own
+        tokens; it can only ask this same gateway for one, same as always.
+        """
+        if registry.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        return {
+            "enabled": settings.media_enabled,
+            "url": settings.livekit_url or None,
+        }
+
+    @app.post("/v1/sessions/{session_id}/media/token")
+    async def candidate_media_token(session_id: str) -> dict[str, Any]:
+        """A publish-only token for the candidate's own room.
+
+        Deliberately not accepting a role parameter from the caller — see
+        `VideoGrant.publisher`. The grant this issues can never subscribe,
+        record, or admin the room; a candidate-scoped identity that could
+        do any of those would be a much more useful thing for a
+        compromised renderer to have extracted than a publish-only one.
+
+        Authorised the same way the identity and audio endpoints are:
+        knowledge of `session_id`, a 96-bit random value never guessable
+        and never logged in a way this service controls — see
+        ARCHITECTURE.md § 5.6 for why a stronger, signature-based scheme
+        is a documented hardening step rather than done here.
+        """
+        session = registry.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        if not settings.media_enabled:
+            raise HTTPException(
+                status_code=503, detail="media disabled: no consent notice configured"
+            )
+        token = media_provider.candidate_token(session_id, identity="candidate")
+        return {"url": settings.livekit_url, "token": token}
+
+    @app.post("/v1/proctor/sessions/{session_id}/media/token")
+    async def proctor_media_token(
+        session_id: str, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        """A subscribe-and-record token for a proctor watching this session.
+
+        Console-token gated. This is the elevation-of-privilege boundary
+        that matters most in this module: nothing a candidate holds can
+        ever reach this grant shape (`VideoGrant.subscriber`, which can
+        watch and can start a recording) — see
+        test_a_candidate_cannot_obtain_a_proctor_grant.
+        """
+        _require_console_token(settings, _bearer(authorization))
+        if registry.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        if not settings.media_enabled:
+            raise HTTPException(
+                status_code=503, detail="media disabled: no consent notice configured"
+            )
+        # "proctor" rather than a per-reviewer identity: there is no
+        # per-proctor identity system yet — the same known gap already
+        # noted for the console generally (nothing here newly introduces
+        # it; it is worth closing before this is relied on for real review).
+        token = media_provider.proctor_token(session_id, identity="proctor")
+        return {"url": settings.livekit_url, "token": token}
+
+    @app.post("/v1/proctor/sessions/{session_id}/media/recording/start", status_code=201)
+    async def start_recording(
+        session_id: str, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        _require_console_token(settings, _bearer(authorization))
+        if registry.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        if not settings.media_enabled:
+            raise HTTPException(
+                status_code=503, detail="media disabled: no consent notice configured"
+            )
+
+        now = settings.clock()
+        try:
+            # Threaded: the real provider makes a blocking network call to
+            # start Egress, the same reason embed/transcribe/classify run
+            # through asyncio.to_thread rather than directly in the handler.
+            started = await asyncio.to_thread(media_provider.start_recording, session_id)
+        except RoomProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        record = RecordingRecord(
+            recording_id=str(uuid.uuid4()),
+            session_id=session_id,
+            status=RecordingStatus.REQUESTED,
+            requested_ms=now,
+            egress_id=started.egress_id,
+        )
+        store.save_recording(record.as_dict(), now)
+        return record.as_dict()
+
+    @app.post("/v1/proctor/sessions/{session_id}/media/recording/{recording_id}/stop")
+    async def stop_recording(
+        session_id: str,
+        recording_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _require_console_token(settings, _bearer(authorization))
+        stored = store.load_recording(recording_id)
+        if stored is None or stored["session_id"] != session_id:
+            raise HTTPException(status_code=404, detail="recording not found")
+
+        record = _recording_from_dict(stored)
+        try:
+            record.transition(RecordingStatus.STOPPING, settings.clock())
+        except InvalidTransition as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if record.egress_id is not None:
+            try:
+                await asyncio.to_thread(media_provider.stop_recording, session_id, record.egress_id)
+            except RoomProviderError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        store.save_recording(record.as_dict(), settings.clock())
+        return record.as_dict()
+
+    @app.get("/v1/proctor/sessions/{session_id}/media/recordings")
+    async def list_recordings(
+        session_id: str, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        _require_console_token(settings, _bearer(authorization))
+        return {"recordings": store.load_recordings_for_session(session_id)}
+
+    @app.post("/v1/media/webhook")
+    async def media_webhook(request: Request) -> dict[str, Any]:
+        """LiveKit's room/recording lifecycle notifications.
+
+        Authenticated by LiveKit's own webhook signature scheme, not the
+        console bearer token — this endpoint is called by the SFU, not a
+        proctor's browser. See `proctor_media.tokens.verify_webhook` for
+        exactly what is checked and its confidence caveats.
+        """
+        body = await request.body()
+        try:
+            event = verify_webhook(
+                body,
+                request.headers.get("Authorize"),
+                LiveKitCredentials(settings.livekit_api_key, settings.livekit_api_secret),
+            )
+        except TokenError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+        _apply_webhook_event(store, event, settings.clock())
+        return {"status": "ok"}
+
     @app.get("/v1/proctor/sessions")
     async def proctor_sessions(authorization: str | None = Header(default=None)):
         _require_console_token(settings, _bearer(authorization))
@@ -756,6 +945,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.transcriber = transcriber
     app.state.intent_classifier = intent_classifier
     app.state.audio_monitor = audio_monitor
+    app.state.media_provider = media_provider
     app.state.settings = settings
     return app
 
@@ -921,6 +1111,94 @@ def _purge_transcripts(store: Any, settings: Settings) -> None:
             removed,
             settings.audio_transcript_retention_days,
         )
+
+
+def _purge_recordings(store: Any, settings: Settings) -> None:
+    if settings.recording_retention_days <= 0:
+        return
+    cutoff = settings.clock() - settings.recording_retention_days * 86_400_000
+    removed = store.purge_recordings_older_than(cutoff)
+    if removed:
+        log.info(
+            "retention: removed %d recording reference(s) older than %d day(s) "
+            "(the referenced objects in your storage backend are not deleted "
+            "by this — see purge_recordings_older_than)",
+            removed,
+            settings.recording_retention_days,
+        )
+
+
+def _recording_from_dict(stored: dict[str, Any]) -> RecordingRecord:
+    return RecordingRecord(
+        recording_id=stored["recording_id"],
+        session_id=stored["session_id"],
+        status=RecordingStatus(stored["status"]),
+        requested_ms=stored["requested_ms"],
+        started_ms=stored.get("started_ms"),
+        stopped_ms=stored.get("stopped_ms"),
+        egress_id=stored.get("egress_id"),
+        storage_ref=stored.get("storage_ref"),
+        failure_reason=stored.get("failure_reason"),
+    )
+
+
+def _apply_webhook_event(store: Any, event: Any, now_ms: int) -> None:
+    """Update a recording's stored status from a LiveKit webhook.
+
+    Looked up by `egress_id`, not by scanning for a room name match: an
+    event with no egress info (a plain room_started/room_finished with no
+    recording involved) has nothing here to update, and is silently
+    ignored rather than treated as an error — most webhook deliveries this
+    endpoint receives will be exactly that.
+    """
+    if not event.egress_id:
+        return
+
+    with_session = store.find_recording_by_egress_id(event.egress_id)
+    if with_session is None:
+        log.warning(
+            "webhook for unknown egress_id %s (event=%s); ignoring",
+            event.egress_id,
+            event.event,
+        )
+        return
+
+    record = _recording_from_dict(with_session)
+    target = _STATUS_FOR_EVENT.get(event.event)
+    if target is None:
+        return
+
+    if event.event == "egress_ended":
+        succeeded = (event.egress_status or "").upper() in ("EGRESS_COMPLETE", "COMPLETE")
+        target = RecordingStatus.AVAILABLE if succeeded else RecordingStatus.FAILED
+        if event.storage_ref:
+            record.storage_ref = event.storage_ref
+        if not succeeded:
+            record.failure_reason = event.egress_status
+
+    try:
+        record.transition(target, now_ms)
+    except InvalidTransition:
+        # An out-of-order or duplicate delivery — LiveKit does not
+        # guarantee ordering across webhook retries. Logged, not raised:
+        # a webhook endpoint that 500s on a delivery order it does not
+        # control invites the sender to retry the same problematic
+        # delivery forever.
+        log.warning(
+            "ignoring out-of-order webhook: egress %s already %s, got %s",
+            event.egress_id,
+            record.status,
+            target,
+        )
+        return
+
+    store.save_recording(record.as_dict(), now_ms)
+
+
+_STATUS_FOR_EVENT = {
+    "egress_started": RecordingStatus.ACTIVE,
+    "egress_ended": RecordingStatus.AVAILABLE,  # refined in _apply_webhook_event
+}
 
 
 def _restore(

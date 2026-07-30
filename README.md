@@ -7,8 +7,10 @@ and evidence. Raw video never touches the telemetry path.
 Rebuilt from scratch. The original OpenCV desktop scripts are preserved on
 the `upstream/master` remote for reference.
 
-> **Not production ready.** No session recording, no audio pipeline. See ARCHITECTURE.md § 8 for the full list, and § 3.2
-> for a documented, unclosed gap in clock-stretch detection.
+> **Not production ready.** The SFU/recording integration is backend-only —
+> the client does not yet join a media room. See ARCHITECTURE.md § 8 for
+> the full list, and § 3.2 for a documented, unclosed gap in clock-stretch
+> detection.
 
 ---
 
@@ -68,6 +70,7 @@ Drive a simulated candidate against it:
 | `proctor_gateway.store` | SQLite persistence + retention |
 | `proctor_identity` | Enrolment, face matching, temporal decision |
 | `proctor_audio` | Transcription, intent classification, temporal escalation |
+| `proctor_media` | LiveKit tokens, webhook verification, recording lifecycle |
 
 The full chain has been run end-to-end — camera → MediaPipe → IPC → signed
 WebSocket → gateway → fusion → proctor stream — against a synthetic camera
@@ -135,8 +138,26 @@ themselves; the console dereferences that one level further, and shows
 "no longer available" once it's past retention rather than failing
 silently.
 
-Not yet built: SFU and recording, client-side microphone capture/VAD, ID
-document capture.
+The media plane — a self-hosted [LiveKit](https://livekit.io/) SFU for the
+candidate/proctor call, plus optional recording — is built as a backend
+integration layer, gated the same way as identity and audio:
+
+```bash
+PROCTOR_MEDIA_CONSENT_NOTICE="candidates shown a live-video notice at exam start"
+PROCTOR_LIVEKIT_URL=wss://livekit.example.org PROCTOR_LIVEKIT_API_KEY=... PROCTOR_LIVEKIT_API_SECRET=...
+```
+
+Leaving `PROCTOR_LIVEKIT_URL` unset selects a fake room provider — no
+network call, no real server — the same "empty selects the test double"
+convention as the face and speech models, except the reason here is
+simply that no LiveKit server was available to test against, not
+licensing or dependency weight. Candidate tokens can only ever publish;
+proctor tokens (subscribe + start recording) are gated behind the console
+token, the same elevation-of-privilege boundary the rest of the proctor
+API already enforces. See ARCHITECTURE.md § 5.6.
+
+Not yet built: the Electron client joining or publishing to a media room,
+client-side microphone capture/VAD, ID document capture.
 
 ## Running the client
 
@@ -190,7 +211,7 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (204) and TypeScript (29). The suite has three parts, and the last
+Python (250) and TypeScript (29). The suite has three parts, and the last
 two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest

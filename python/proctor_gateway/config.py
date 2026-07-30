@@ -155,6 +155,47 @@ class Settings:
     for no functional benefit.
     """
 
+    livekit_url: str = ""
+    """Self-hosted LiveKit server URL (e.g. `wss://livekit.example.org`).
+
+    Empty selects `FakeRoomProvider` — no network call, no real server —
+    the same "empty selects the test double" convention as
+    `face_model_path` and `audio_model_path`. Unlike those, the reason is
+    neither licensing nor dependency weight: there is simply no LiveKit
+    server available in the environment this was built in to test
+    against. See `proctor_media.provider`'s module docstring for exactly
+    which parts of the integration rest on solid, long-documented ground
+    (tokens, webhooks) versus a best-effort against a more version-
+    sensitive one (the Egress recording RPC).
+    """
+
+    livekit_api_key: str = ""
+    livekit_api_secret: str = ""
+
+    media_consent_notice: str = ""
+    """A record that candidates were shown a notice before their camera and
+    microphone were streamed to a proctor over WebRTC and, if recording is
+    started, retained as video.
+
+    One gate for both joining the room and recording, not two: a live
+    video call is itself processing of biometric-adjacent data even
+    before anyone presses record, so gating only the recording would be
+    false comfort. Retention below is still its own, separate, shorter
+    clock — the recorded artifact is materially more sensitive than the
+    live stream passing through.
+    """
+
+    recording_retention_days: int = 14
+    """How long a recording *reference* (not the video itself — see
+    `proctor_gateway.store.SqliteStore.purge_recordings_older_than`) is
+    kept. Shorter than the 30-day violation default, deliberately: this is
+    the single most sensitive artifact this platform touches — video and
+    audio of a candidate in their own room — and the appeals/dispute
+    window it needs to survive for is an institutional policy question,
+    not a technical one. Tune it to that policy; do not leave it at a
+    default chosen for convenience.
+    """
+
     console_token: str = ""
     """Bearer token required to read the proctor stream.
 
@@ -199,6 +240,11 @@ class Settings:
             ),
             # llm_complete is intentionally absent here: it is code, not an
             # environment value. See its docstring.
+            livekit_url=os.environ.get("PROCTOR_LIVEKIT_URL", ""),
+            livekit_api_key=os.environ.get("PROCTOR_LIVEKIT_API_KEY", ""),
+            livekit_api_secret=os.environ.get("PROCTOR_LIVEKIT_API_SECRET", ""),
+            media_consent_notice=os.environ.get("PROCTOR_MEDIA_CONSENT_NOTICE", ""),
+            recording_retention_days=int(os.environ.get("PROCTOR_RECORDING_RETENTION_DAYS", "14")),
         )
 
     @property
@@ -226,6 +272,16 @@ class Settings:
         surfaced to a human without an automated intent read on top.
         """
         return bool(self.audio_consent_notice.strip())
+
+    @property
+    def media_enabled(self) -> bool:
+        """SFU/recording runs only when a consent record exists.
+
+        Same fail-closed shape as identity and audio, gating on the risk
+        specific to this feature: consent to being live-streamed and
+        potentially recorded, not measurement accuracy or transcription.
+        """
+        return bool(self.media_consent_notice.strip())
 
     @property
     def has_configured_console_token(self) -> bool:

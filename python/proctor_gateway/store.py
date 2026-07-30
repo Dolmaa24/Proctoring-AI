@@ -133,6 +133,32 @@ CREATE INDEX IF NOT EXISTS audio_checks_by_session
     ON audio_checks (session_id, recorded_ms);
 CREATE INDEX IF NOT EXISTS audio_checks_by_age
     ON audio_checks (recorded_ms);
+-- Recordings. Tracks a *reference* to where a recording ended up (an
+-- egress id, a storage URI), never the video bytes — the same principle
+-- as an identity template or an audio transcript, applied to the single
+-- most sensitive artifact this platform touches. Purging a row here
+-- removes our reference to the recording; it does not delete the object
+-- from wherever the operator's storage actually lives (S3, GCS, ...) —
+-- see purge_recordings_older_than.
+CREATE TABLE IF NOT EXISTS recordings (
+    recording_id    TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    requested_ms    INTEGER NOT NULL,
+    started_ms      INTEGER,
+    stopped_ms      INTEGER,
+    egress_id       TEXT,
+    storage_ref     TEXT,
+    failure_reason  TEXT,
+    updated_ms      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS recordings_by_session
+    ON recordings (session_id, requested_ms);
+CREATE INDEX IF NOT EXISTS recordings_by_age
+    ON recordings (updated_ms);
+CREATE INDEX IF NOT EXISTS recordings_by_egress
+    ON recordings (egress_id);
 CREATE INDEX IF NOT EXISTS templates_by_age
     ON identity_templates (created_ms);
 CREATE INDEX IF NOT EXISTS checks_by_session
@@ -216,6 +242,11 @@ class Store(Protocol):
     ) -> None: ...
     def load_audio_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]: ...
     def purge_transcripts_older_than(self, cutoff_ms: int) -> int: ...
+    def save_recording(self, record: dict[str, Any], now_ms: int) -> None: ...
+    def load_recording(self, recording_id: str) -> dict[str, Any] | None: ...
+    def load_recordings_for_session(self, session_id: str) -> list[dict[str, Any]]: ...
+    def find_recording_by_egress_id(self, egress_id: str) -> dict[str, Any] | None: ...
+    def purge_recordings_older_than(self, cutoff_ms: int) -> int: ...
     def close(self) -> None: ...
 
 
@@ -299,6 +330,21 @@ class MemoryStore:
     def purge_transcripts_older_than(self, cutoff_ms: int) -> int:
         return 0
 
+    def save_recording(self, record: dict[str, Any], now_ms: int) -> None:
+        return None
+
+    def load_recording(self, recording_id: str) -> dict[str, Any] | None:
+        return None
+
+    def load_recordings_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        return []
+
+    def find_recording_by_egress_id(self, egress_id: str) -> dict[str, Any] | None:
+        return None
+
+    def purge_recordings_older_than(self, cutoff_ms: int) -> int:
+        return 0
+
     def close(self) -> None:
         return None
 
@@ -320,6 +366,20 @@ def _violation_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "resolved": bool(row["resolved"]),
         "recorded_ms": row["recorded_ms"],
         "evidence": json.loads(row["evidence"]),
+    }
+
+
+def _recording_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "recording_id": row["recording_id"],
+        "session_id": row["session_id"],
+        "status": row["status"],
+        "requested_ms": row["requested_ms"],
+        "started_ms": row["started_ms"],
+        "stopped_ms": row["stopped_ms"],
+        "egress_id": row["egress_id"],
+        "storage_ref": row["storage_ref"],
+        "failure_reason": row["failure_reason"],
     }
 
 
@@ -682,6 +742,86 @@ class SqliteStore:
         with self._lock:
             removed = self._db.execute(
                 "DELETE FROM audio_transcripts WHERE recorded_ms < ?", (cutoff_ms,)
+            ).rowcount
+            self._db.commit()
+        return max(0, removed)
+
+    # -- recordings ----------------------------------------------------------
+
+    def save_recording(self, record: dict[str, Any], now_ms: int) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO recordings (
+                    recording_id, session_id, status, requested_ms, started_ms,
+                    stopped_ms, egress_id, storage_ref, failure_reason, updated_ms
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(recording_id) DO UPDATE SET
+                    status         = excluded.status,
+                    started_ms     = excluded.started_ms,
+                    stopped_ms     = excluded.stopped_ms,
+                    egress_id      = excluded.egress_id,
+                    storage_ref    = excluded.storage_ref,
+                    failure_reason = excluded.failure_reason,
+                    updated_ms     = excluded.updated_ms
+                """,
+                (
+                    record["recording_id"],
+                    record["session_id"],
+                    record["status"],
+                    record["requested_ms"],
+                    record.get("started_ms"),
+                    record.get("stopped_ms"),
+                    record.get("egress_id"),
+                    record.get("storage_ref"),
+                    record.get("failure_reason"),
+                    now_ms,
+                ),
+            )
+            self._db.commit()
+
+    def load_recording(self, recording_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM recordings WHERE recording_id = ?", (recording_id,)
+            ).fetchone()
+        return _recording_row_to_dict(row) if row is not None else None
+
+    def load_recordings_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM recordings WHERE session_id = ? ORDER BY requested_ms ASC",
+                (session_id,),
+            ).fetchall()
+        return [_recording_row_to_dict(row) for row in rows]
+
+    def find_recording_by_egress_id(self, egress_id: str) -> dict[str, Any] | None:
+        """Webhook deliveries key on `egressId`, not `session_id` or
+        `recording_id` — this is the one lookup path in the whole module
+        that needs a different key, hence its own indexed query rather
+        than a scan over `load_recordings_for_session`.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM recordings WHERE egress_id = ?", (egress_id,)
+            ).fetchone()
+        return _recording_row_to_dict(row) if row is not None else None
+
+    def purge_recordings_older_than(self, cutoff_ms: int) -> int:
+        """Expire recording *references* on their own clock.
+
+        This deletes our metadata row — the egress id, the storage
+        reference, the lifecycle timestamps. It does **not** delete the
+        actual recording from wherever the operator's storage lives (S3,
+        GCS, ...); that is the operator's storage lifecycle policy's job,
+        the same boundary `LiveKitRoomProvider` draws around not handling
+        object storage credentials itself. Treating this purge as
+        equivalent to deleting the video would be a false sense of
+        compliance.
+        """
+        with self._lock:
+            removed = self._db.execute(
+                "DELETE FROM recordings WHERE updated_ms < ?", (cutoff_ms,)
             ).rowcount
             self._db.commit()
         return max(0, removed)

@@ -535,6 +535,141 @@ been purged, that endpoint 404s and the console shows exactly that rather
 than failing silently — the flag and its labels survive independently of
 whether the words still exist.
 
+## 5.6 Media plane: SFU and recording
+
+Everything above this section describes the telemetry path: signed
+observations, never raw video. This section describes the other path —
+the actual audio/video call between a candidate and a proctor, and its
+optional recording — which is a genuinely separate system with its own
+trust boundary, not an extension of the telemetry protocol.
+
+**Scope, stated up front.** This is a backend integration layer against a
+self-hosted [LiveKit](https://livekit.io/) (Apache-2.0) deployment: token
+issuance, webhook verification, and recording lifecycle tracking. It was
+built and tested with no live LiveKit server available in this
+environment — see the confidence note in
+`proctor_media.provider`'s module docstring for exactly which parts rest
+on solid ground (tokens, webhooks — long-stable, widely-used API surface)
+versus which are a best-effort against a documented but more
+version-sensitive RPC (the Egress recording calls). Test this against
+your actual deployed server version before relying on it in production.
+
+### 5.6.1 Why LiveKit, and why self-hosted
+
+Chosen over a hosted-only alternative because this project already treats
+"an institution can run this entirely on infrastructure it controls" as a
+requirement, not a nice-to-have — the same reasoning behind vendoring
+MediaPipe and keeping face/audio models pluggable rather than calling out
+to a hosted API. LiveKit is Apache-2.0, self-hostable, and its access-token
+and webhook formats are stable enough to implement confidently without a
+live server (§ 5.6 scope note above).
+
+### 5.6.2 Token model: the elevation-of-privilege boundary
+
+`proctor_media.tokens.VideoGrant` has two constructors, and this is
+deliberate: a caller cannot assemble an arbitrary grant, only ask for
+`VideoGrant.publisher(room)` or `VideoGrant.subscriber(room)`. Their fields
+are fixed, not caller-configurable:
+
+- **Candidate grant** (`publisher`): `canPublish=True`,
+  `canSubscribe=False`, `roomRecord=False`, `roomAdmin=False`. A leaked
+  candidate token is useless for watching or recording anyone — it can
+  only publish the candidate's own camera/mic into their own room.
+- **Proctor grant** (`subscriber`): `canPublish=False`,
+  `canSubscribe=True`, `roomRecord=True`. Can watch and can start a
+  recording, never publish.
+
+This asymmetry is enforced structurally, in the dataclass, rather than
+left to each call site to remember to set the right five fields correctly
+— the same design instinct as `Threshold` and `MatchPolicy` requiring
+explicit construction elsewhere in this codebase.
+
+The gateway layers its own authorization on top: `POST
+/v1/sessions/{id}/media/token` (candidate grant) needs only the
+`session_id` — the same bearer-capability model already used by the
+identity and audio endpoints (see § 5.4/5.5; a 96-bit
+`secrets.token_hex(12)` value, never logged, never guessable, but a
+capability token rather than a signed request). `POST
+/v1/proctor/sessions/{id}/media/token` (proctor grant) additionally
+requires the console bearer token. Nothing a candidate's client holds can
+ever reach the proctor grant shape — proven in
+`test_a_candidate_cannot_obtain_a_proctor_grant`
+(`python/tests/test_media_api.py`). Moving session-scoped auth to a
+stronger signature-based scheme is a documented hardening step for a real
+deployment, not something this repository does today; it would apply
+identically to identity, audio, and media.
+
+### 5.6.3 Webhook verification
+
+LiveKit signs webhook deliveries with a JWT in a custom `Authorize`
+header whose payload commits to `sha256(body)`. `verify_webhook` checks,
+in order: the JWT's own HMAC signature (wrong secret → rejected), its
+`iss` claim against the configured API key (a webhook signed by a
+*different* LiveKit project's credentials → rejected), and — the check
+that actually matters — that the claimed `sha256` matches the hash of the
+body **as received**. Verifying only the JWT's signature would pass a
+validly-signed header attached to a swapped body; the body-hash comparison
+is what catches that
+(`test_a_tampered_body_is_rejected_even_with_a_validly_signed_header`,
+`python/tests/test_media.py`).
+
+### 5.6.4 Recording lifecycle: not a temporal-discipline problem
+
+`proctor_media.recording.RecordingRecord` is a plain state machine
+(`REQUESTED → ACTIVE → {STOPPING, AVAILABLE, FAILED}`), and deliberately
+has none of the onset/sustained-disagreement machinery built for the
+fusion engine's rules, identity's mismatch gate, or audio's seeking-help
+gate. Those all exist to stop a probabilistic inference about a
+candidate's behaviour from firing on one noisy sample. Starting or
+stopping a recording is not an inference about the candidate at all — a
+proctor clicked a button — so there is nothing here for that kind of
+discipline to protect against.
+
+What the state machine does have to account for is delivery order, twice
+over, and both were found by writing the tests rather than by inspection
+first:
+
+- A recording can reach `AVAILABLE` directly from `ACTIVE` with no local
+  `STOPPING` step ever happening — the candidate disconnects, the room
+  closes, and the completion webhook arrives having never been asked to
+  stop locally.
+- The same is true one step earlier, from `REQUESTED`: a proctor can click
+  "stop" (or the recording can simply finish) before the `egress_started`
+  confirmation webhook has arrived at all. LiveKit gives no ordering
+  guarantee across webhook retries, and a proctor's local click is not a
+  webhook in the first place, so `REQUESTED` reaches every later state
+  directly, exactly as `ACTIVE` does.
+
+An out-of-order or duplicate delivery that would otherwise corrupt state
+(e.g. a late `egress_started` arriving after `egress_ended` already
+marked a recording `FAILED`) is logged and ignored rather than raised as
+an error back to LiveKit — a webhook endpoint that 500s on a delivery
+order it does not control just invites the sender to retry the same
+problematic delivery forever.
+
+`RecordingRecord.as_dict()` never carries recording bytes or a playable
+URL, only a `storage_ref` — the same "reference, not the artifact"
+principle as an identity template or an audio transcript, applied to the
+single most sensitive artifact this platform touches.
+
+### 5.6.5 Consent and retention
+
+`media_consent_notice` is one gate for both joining the room and
+recording it, not two: a live video call between a candidate and a
+proctor is itself processing of biometric-adjacent data before anyone
+presses record, so gating only the recording would be false comfort.
+
+`recording_retention_days` (default 14) is its own, shorter clock than the
+30-day violation default — deliberately, this is the single most
+sensitive artifact the platform touches. Purging a recording row deletes
+this project's *reference* to it (the egress id, the storage URI, the
+lifecycle timestamps); it does not delete the actual object from wherever
+the operator's storage backend holds it (S3, GCS, ...). That is the
+operator's storage lifecycle policy's job — the same boundary
+`LiveKitRoomProvider` draws around not handling object storage
+credentials itself. Treating the metadata purge as equivalent to deleting
+the video would be a false sense of compliance.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -573,9 +708,11 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
 client, proctor console (including on-demand violation evidence and
 transcript rendering, § 5.5.8), persistence, identity verification, audio
-pipeline (204 Python + 29 TypeScript tests). The full chain has been run
-end-to-end against a synthetic camera feed in both the face-present and
-no-face cases; see `apps/client/scripts/e2e.mjs`.
+pipeline, and the media plane's backend integration layer — SFU tokens,
+webhook verification, recording lifecycle (§ 5.6) (250 Python + 29
+TypeScript tests). The full chain has been run end-to-end against a
+synthetic camera feed in both the face-present and no-face cases; see
+`apps/client/scripts/e2e.mjs`.
 
 One finding from that run is worth recording, because it is the argument
 for doing it at all. The process blacklist matched the substring `parsec`
@@ -588,12 +725,9 @@ thought of. Matching is now by exact basename with OS-vendor paths
 excluded, and a test runs against the real process table of whatever
 machine it is on.
 
-Not built: SFU and recording, client-side microphone capture and VAD
-(§5.5.6), ID document capture (§5.4.3). Known gap: the proctor console does
-not render violation evidence for any rule yet (§5.5.4) — flags reach the
-board, but the supporting numbers and transcript references are only
-reachable via the API today.
-The proctor stream is now
+Not built: the Electron client does not yet join or publish to a media
+room (§ 5.6 is backend-only so far), client-side microphone capture and
+VAD (§ 5.5.6), ID document capture (§ 5.4.3). The proctor stream is now
 token-authenticated and fails closed, but there is still no per-proctor
 identity, no audit of who looked at whom, and no TLS termination here —
 do not expose this gateway publicly without putting those in front of it.
