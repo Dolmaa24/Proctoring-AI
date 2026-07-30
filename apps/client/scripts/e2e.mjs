@@ -34,6 +34,7 @@ const PORT = Number(flag("--port", "8099"));
 const SECONDS = Number(flag("--seconds", "10"));
 const VIDEO = flag("--video", null);
 const GATEWAY = `http://localhost:${PORT}`;
+const CONSOLE_TOKEN = "e2e-console-token";
 
 const observed = { signals: new Map(), violations: [], sessions: new Set() };
 let gateway;
@@ -49,7 +50,12 @@ async function startGateway() {
     ["proctor_gateway.app:app", "--port", String(PORT), "--log-level", "warning"],
     {
       cwd: repoRoot,
-      env: { ...process.env, PYTHONPATH: "python", PROCTOR_MASTER_SECRET: "e2e-secret" },
+      env: {
+        ...process.env,
+        PYTHONPATH: "python",
+        PROCTOR_MASTER_SECRET: "e2e-secret",
+        PROCTOR_CONSOLE_TOKEN: CONSOLE_TOKEN,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -71,11 +77,25 @@ async function startGateway() {
 }
 
 function watchProctor() {
-  const socket = new WebSocket(`ws://localhost:${PORT}/v1/proctor/stream`);
+  // The proctor stream fails closed (see config.py's `console_token`) —
+  // it carries every candidate's flags, so an unauthenticated watcher
+  // gets rejected rather than let through.
+  const socket = new WebSocket(`ws://localhost:${PORT}/v1/proctor/stream`, [
+    "proctor.console.v1",
+    `token.${CONSOLE_TOKEN}`,
+  ]);
   socket.on("message", (raw) => {
     const message = JSON.parse(raw.toString());
     if (message.kind === "violation") observed.violations.push(message);
     if (message.session_id) observed.sessions.add(message.session_id);
+  });
+  // An unhandled 'error' event crashes the whole Node process, skipping
+  // the try/catch below (it fires async, after that block has returned)
+  // and orphaning the spawned gateway subprocess to sit on this port
+  // forever. A rejected connection here is a bug to report, not a reason
+  // to leak a process.
+  socket.on("error", (error) => {
+    console.error("proctor stream connection failed:", error.message);
   });
   return socket;
 }

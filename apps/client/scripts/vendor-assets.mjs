@@ -1,13 +1,16 @@
 /**
- * Vendor the MediaPipe runtime and model into the app bundle.
+ * Vendor the MediaPipe runtime, model, and LiveKit client into the app
+ * bundle.
  *
- * The exam client must work on a locked-down network, and a model fetched
- * from the internet at exam time is a model nobody has attested. Both the
- * WASM runtime and the .task file are therefore shipped inside the app.
+ * The exam client must work on a locked-down network, and an asset fetched
+ * from the internet at exam time is one nobody has attested. The MediaPipe
+ * WASM runtime, the face model, and the LiveKit client SDK are therefore
+ * all shipped inside the app rather than loaded from a CDN.
  *
- * The WASM comes from the installed npm package (no network). The model is
- * downloaded once from Google's official MediaPipe host and its digest is
- * recorded, so a changed file is visible rather than silent.
+ * The WASM and the LiveKit bundle come from installed npm packages (no
+ * network). The face model is downloaded once from Google's official
+ * MediaPipe host and its digest is recorded, so a changed file is visible
+ * rather than silent.
  *
  *   node scripts/vendor-assets.mjs
  *   node scripts/vendor-assets.mjs --verify   # digests only, no download
@@ -29,6 +32,13 @@ const bundleSource = path.join(
   "@mediapipe",
   "tasks-vision",
   "vision_bundle.mjs",
+);
+const livekitSource = path.join(
+  clientRoot,
+  "node_modules",
+  "livekit-client",
+  "dist",
+  "livekit-client.esm.mjs",
 );
 
 const MODEL = {
@@ -55,6 +65,14 @@ async function vendorWasm() {
   // and there is no bundler in this build.
   await copyFile(bundleSource, path.join(vendorRoot, "vision_bundle.mjs"));
   return files.length + 1;
+}
+
+async function vendorLiveKit() {
+  // A single self-contained ESM bundle — livekit-client has no external
+  // imports at runtime (checked when this was added), same shape as
+  // MediaPipe's vision_bundle.mjs above, so it vendors the same way: copy
+  // once, import by relative path, no bundler involved.
+  await copyFile(livekitSource, path.join(vendorRoot, "livekit-client.mjs"));
 }
 
 async function vendorModel() {
@@ -90,6 +108,10 @@ async function writeManifest() {
         source: "@mediapipe/tasks-vision (npm)",
         digest: await sha256(path.join(vendorRoot, "wasm", "vision_wasm_internal.wasm")),
       },
+      "livekit-client.mjs": {
+        source: "livekit-client (npm)",
+        digest: await sha256(path.join(vendorRoot, "livekit-client.mjs")),
+      },
     },
   };
   await writeFile(MANIFEST, JSON.stringify(manifest, null, 2) + "\n");
@@ -119,6 +141,8 @@ console.log("vendoring MediaPipe assets:");
 const copied = await vendorWasm();
 console.log(`  copied ${copied} runtime files from node_modules`);
 await vendorModel();
+console.log("vendoring livekit-client:");
+await vendorLiveKit();
 const manifest = await writeManifest();
 console.log("\ndigests:");
 for (const [name, entry] of Object.entries(manifest.assets)) {

@@ -43,6 +43,37 @@ async function enrol(): Promise<Enrolment> {
   return (await response.json()) as Enrolment;
 }
 
+interface MediaJoin {
+  url: string;
+  token: string;
+}
+
+/**
+ * The media plane's join info, or null if it is disabled or unreachable.
+ *
+ * Fetched from main, not the renderer: the same "renderer only ever
+ * receives what it is explicitly handed" boundary as everything else in
+ * this file. Two calls, not one, because the gateway asks the same thing
+ * of every media caller — see `_build_media_provider` and
+ * `candidate_media_token` in `proctor_gateway.app`: config first (is this
+ * even turned on for this deployment) and only then a token, so a
+ * disabled deployment never needs a candidate-scoped credential minted
+ * for a call that was never going to happen.
+ */
+async function fetchMediaJoin(sessionId: string): Promise<MediaJoin | null> {
+  const configResponse = await fetch(`${GATEWAY_URL}/v1/sessions/${sessionId}/media/config`);
+  if (!configResponse.ok) return null;
+  const config = (await configResponse.json()) as { enabled: boolean; url: string | null };
+  if (!config.enabled || !config.url) return null;
+
+  const tokenResponse = await fetch(`${GATEWAY_URL}/v1/sessions/${sessionId}/media/token`, {
+    method: "POST",
+  });
+  if (!tokenResponse.ok) return null;
+  const body = (await tokenResponse.json()) as { token: string };
+  return { url: config.url, token: body.token };
+}
+
 function createWindow(): BrowserWindow {
   const created = new BrowserWindow({
     width: 1100,
@@ -103,6 +134,17 @@ async function startSession(): Promise<void> {
   telemetry = new TelemetryClient(GATEWAY_URL, enrolment, importSessionKey);
   await telemetry.start();
 
+  // Fetched once, up front, rather than lazily on the renderer's first
+  // ask: whether the media plane is enabled does not change mid-session,
+  // and an unreachable LiveKit deployment should not make every later
+  // check pay that latency (or failure) again. A rejection here must not
+  // fail the exam session — the signed telemetry path is what's load-
+  // bearing; the live video call is additive.
+  const mediaJoin = fetchMediaJoin(enrolment.session_id).catch((error: unknown) => {
+    console.error("media plane unavailable, continuing without it:", error);
+    return null;
+  });
+
   await telemetry.emit({ type: "lifecycle", phase: "session_start" });
   await telemetry.emit(buildAttestation());
 
@@ -121,6 +163,8 @@ async function startSession(): Promise<void> {
     await telemetry.emit(payload);
     return true;
   });
+
+  ipcMain.handle("proctor:media-join", () => mediaJoin);
 
   setInterval(async () => {
     if (!telemetry) return;

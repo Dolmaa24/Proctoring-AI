@@ -670,6 +670,51 @@ operator's storage lifecycle policy's job — the same boundary
 credentials itself. Treating the metadata purge as equivalent to deleting
 the video would be a false sense of compliance.
 
+### 5.6.6 The Electron client side
+
+The renderer joins and publishes through `livekit-client` (Apache-2.0),
+vendored the same way as MediaPipe's WASM bundle — a single self-contained
+ESM file (`livekit-client` ships one at `dist/livekit-client.esm.mjs`,
+confirmed to carry no external imports) copied into `models/` and mapped
+in the inline import map, so it resolves over `file://` with no bundler.
+`scripts/vendor-assets.mjs` copies it and records its digest in
+`manifest.json` alongside the MediaPipe assets, for the same reason: an
+asset swapped after the fact should be visible, not silent.
+
+**Handing the renderer a token is a different call than withholding the
+telemetry session key** (`telemetry.ts`), not an inconsistency in it.
+That key signs arbitrary observations with Node's HMAC primitives and has
+no reason to ever leave main; a LiveKit token has to reach the renderer
+regardless, because `livekit-client` needs `RTCPeerConnection` and
+`getUserMedia`, which only exist in a DOM context. What keeps this safe
+is the token's own shape (§ 5.6.2), not where it is held.
+
+`joinMediaRoom` (`src/renderer/media.ts`) is deliberately not load-bearing
+for monitoring: it is called after MediaPipe is already running, publishes
+the same camera `MediaStreamTrack` MediaPipe reads from (not a second
+`getUserMedia` call — one device, one consumer count, no double prompt),
+and any failure — media disabled, no LiveKit reachable, connection
+refused — is caught and logged, never thrown back into the caller. The
+signed telemetry path is what the fusion engine rules on; the live call
+is additive. Microphone access is requested separately, and only after a
+room join actually succeeds — MediaPipe never touches audio, so asking
+earlier would be a permission prompt with no purpose behind it yet.
+
+**CSP.** The renderer's Content-Security-Policy pins `script-src` to an
+exact hash of the inline import map, so allowing `livekit-client` to
+resolve meant regenerating that hash — `scripts/build.mjs` now recomputes
+it from the actual file and fails the build if the CSP's pinned value
+doesn't match, rather than trusting whoever last edited the import map to
+have done the same arithmetic by hand. Separately, `connect-src` had to
+widen from implicit `'self'` to `'self' wss: https:`: the operator's
+LiveKit URL is a runtime deployment value, fetched from the gateway after
+enrolment, not a build-time constant `script-src`'s exact-hash approach
+could pin. This is a real, if narrow, loosening — only network
+destinations are broadened, not script execution — verified live: a
+`ws://` (unencrypted) LiveKit URL is correctly refused by this CSP, and a
+`wss://` URL is correctly allowed through to attempt (and, against no
+real server, correctly fail) its connection.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -706,28 +751,44 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 ## 8. Status
 
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
-client, proctor console (including on-demand violation evidence and
-transcript rendering, § 5.5.8), persistence, identity verification, audio
-pipeline, and the media plane's backend integration layer — SFU tokens,
-webhook verification, recording lifecycle (§ 5.6) (250 Python + 29
-TypeScript tests). The full chain has been run end-to-end against a
-synthetic camera feed in both the face-present and no-face cases; see
-`apps/client/scripts/e2e.mjs`.
+client (including publishing to a LiveKit room, § 5.6.6), proctor console
+(including on-demand violation evidence and transcript rendering,
+§ 5.5.8), persistence, identity verification, audio pipeline, and the
+media plane — SFU tokens, webhook verification, recording lifecycle
+(§ 5.6) (250 Python + 29 TypeScript tests). The full chain has been run
+end-to-end against a synthetic camera feed in both the face-present and
+no-face cases; see `apps/client/scripts/e2e.mjs`.
 
-One finding from that run is worth recording, because it is the argument
-for doing it at all. The process blacklist matched the substring `parsec`
-to catch the game-streaming app, and on macOS that matches Apple's
-`parsecd` and `parsec-fbf` — CoreParsec, the Spotlight suggestions daemon,
-present on every Mac. **Every macOS candidate would have been flagged for
-running remote-control software and screen sharing.** The unit tests did
-not catch it because they only tested against process names someone had
-thought of. Matching is now by exact basename with OS-vendor paths
-excluded, and a test runs against the real process table of whatever
-machine it is on.
+Two findings from live runs are worth recording, because they are the
+argument for doing this at all. The process blacklist matched the
+substring `parsec` to catch the game-streaming app, and on macOS that
+matches Apple's `parsecd` and `parsec-fbf` — CoreParsec, the Spotlight
+suggestions daemon, present on every Mac. **Every macOS candidate would
+have been flagged for running remote-control software and screen
+sharing.** The unit tests did not catch it because they only tested
+against process names someone had thought of. Matching is now by exact
+basename with OS-vendor paths excluded, and a test runs against the real
+process table of whatever machine it is on.
 
-Not built: the Electron client does not yet join or publish to a media
-room (§ 5.6 is backend-only so far), client-side microphone capture and
-VAD (§ 5.5.6), ID document capture (§ 5.4.3). The proctor stream is now
-token-authenticated and fails closed, but there is still no per-proctor
-identity, no audit of who looked at whom, and no TLS termination here —
-do not expose this gateway publicly without putting those in front of it.
+**A known, unfixed issue, also found by running the real chain rather
+than by inspection:** `apps/client/scripts/e2e.mjs`'s own
+`report()` currently shows `stream_sequence_gap`/`stream_replay` firing
+against an honest client — the gateway is correctly detecting that frames
+sometimes arrive out of sequence order, but the client, not an attacker,
+is the cause. `TelemetryClient.emit()` (`telemetry.ts`) assigns a frame's
+sequence number synchronously, then signs it asynchronously before
+sending; the renderer's detection loop fires several observations per
+tick without awaiting each other, so two overlapping `emit()` calls can
+have their signing resolve in the opposite order their sequence numbers
+were assigned in, and whichever finishes signing first is sent first.
+Confirmed present on this codebase before the media-plane work in this
+section (reproduced identically against commit `144638b` in an isolated
+worktree), so it predates and is unrelated to §5.6 — flagged rather than
+folded into that work, since fixing a send-ordering guarantee correctly
+deserves its own focused change, not a bolt-on to an unrelated feature.
+
+Not built: client-side microphone capture and VAD (§ 5.5.6), ID document
+capture (§ 5.4.3). The proctor stream is now token-authenticated and
+fails closed, but there is still no per-proctor identity, no audit of who
+looked at whom, and no TLS termination here — do not expose this gateway
+publicly without putting those in front of it.

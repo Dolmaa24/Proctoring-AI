@@ -7,10 +7,10 @@ and evidence. Raw video never touches the telemetry path.
 Rebuilt from scratch. The original OpenCV desktop scripts are preserved on
 the `upstream/master` remote for reference.
 
-> **Not production ready.** The SFU/recording integration is backend-only —
-> the client does not yet join a media room. See ARCHITECTURE.md § 8 for
-> the full list, and § 3.2 for a documented, unclosed gap in clock-stretch
-> detection.
+> **Not production ready.** See ARCHITECTURE.md § 8 for the full list —
+> including a known telemetry send-ordering issue that can raise a false
+> replay flag against an honest client — and § 3.2 for a documented,
+> unclosed gap in clock-stretch detection.
 
 ---
 
@@ -65,7 +65,7 @@ Drive a simulated candidate against it:
 | `proctor_gateway` | FastAPI ingest, integrity checks, proctor fan-out |
 | `proctor_sim` | Scripted candidates + six client-tampering modes |
 | `policies/default.yaml` | 16 rules, all flag-only |
-| `apps/client` | Electron client: MediaPipe inference, signed transport, OS observation |
+| `apps/client` | Electron client: MediaPipe inference, signed transport, OS observation, LiveKit publish |
 | `apps/console` | Proctor console: triage queue, per-session audit timeline |
 | `proctor_gateway.store` | SQLite persistence + retention |
 | `proctor_identity` | Enrolment, face matching, temporal decision |
@@ -139,8 +139,8 @@ themselves; the console dereferences that one level further, and shows
 silently.
 
 The media plane — a self-hosted [LiveKit](https://livekit.io/) SFU for the
-candidate/proctor call, plus optional recording — is built as a backend
-integration layer, gated the same way as identity and audio:
+candidate/proctor call, plus optional recording — is gated the same way
+as identity and audio:
 
 ```bash
 PROCTOR_MEDIA_CONSENT_NOTICE="candidates shown a live-video notice at exam start"
@@ -154,10 +154,12 @@ simply that no LiveKit server was available to test against, not
 licensing or dependency weight. Candidate tokens can only ever publish;
 proctor tokens (subscribe + start recording) are gated behind the console
 token, the same elevation-of-privilege boundary the rest of the proctor
-API already enforces. See ARCHITECTURE.md § 5.6.
+API already enforces. The Electron client joins and publishes to its room
+via `livekit-client`, vendored the same way as the MediaPipe assets below.
+See ARCHITECTURE.md § 5.6.
 
-Not yet built: the Electron client joining or publishing to a media room,
-client-side microphone capture/VAD, ID document capture.
+Not yet built: client-side microphone capture/VAD outside a media call,
+ID document capture.
 
 ## Running the client
 
@@ -165,12 +167,12 @@ client-side microphone capture/VAD, ID document capture.
 cd apps/client && npm install && npm run vendor
 ```
 
-`npm run vendor` copies the MediaPipe WASM out of `node_modules` and
-downloads the face landmarker model (3.8 MB, from Google's official host),
-recording SHA-256 digests in `models/manifest.json`. The assets are
-bundled rather than fetched at exam time: the client must work on a
-locked-down network, and a model downloaded during an exam is a model
-nobody has attested.
+`npm run vendor` copies the MediaPipe WASM and the `livekit-client` SDK
+out of `node_modules`, and downloads the face landmarker model (3.8 MB,
+from Google's official host), recording SHA-256 digests in
+`models/manifest.json`. The assets are bundled rather than fetched at
+exam time: the client must work on a locked-down network, and a model
+downloaded during an exam is a model nobody has attested.
 
 End-to-end, with no webcam and no volunteer:
 

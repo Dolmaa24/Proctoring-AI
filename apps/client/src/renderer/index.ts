@@ -19,20 +19,24 @@ import {
 
 import type { FaceSignal, GazeSignal, HeadPoseSignal } from "../protocol/events.generated.ts";
 import { estimateGaze, headPoseFromMatrix, type Landmark } from "./gaze.ts";
+import { joinMediaRoom } from "./media.ts";
+import type { Room } from "livekit-client";
 
 const TELEMETRY_INTERVAL_MS = 100;
 const MAX_FACES = 4;
 
 let landmarker: FaceLandmarker | null = null;
 let lastEmit = 0;
+let mediaRoom: Room | null = null;
 
-async function setupCamera(video: HTMLVideoElement): Promise<void> {
+async function setupCamera(video: HTMLVideoElement): Promise<MediaStream> {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { width: 640, height: 480, facingMode: "user" },
     audio: false,
   });
   video.srcObject = stream;
   await video.play();
+  return stream;
 }
 
 async function setupLandmarker(): Promise<FaceLandmarker> {
@@ -104,8 +108,9 @@ async function main(): Promise<void> {
   const video = document.querySelector<HTMLVideoElement>("#camera")!;
   const status = document.querySelector<HTMLElement>("#status")!;
 
+  let stream: MediaStream;
   try {
-    await setupCamera(video);
+    stream = await setupCamera(video);
     landmarker = await setupLandmarker();
   } catch (error) {
     // The candidate needs to know their session is not being recorded
@@ -120,6 +125,23 @@ async function main(): Promise<void> {
 
   status.textContent = "Monitoring active.";
   status.dataset.state = "ok";
+
+  // Not load-bearing for monitoring: MediaPipe's observations keep
+  // flowing over the signed telemetry path regardless of whether the
+  // live video call could be joined. See media.ts.
+  const videoTrack = stream.getVideoTracks()[0];
+  if (videoTrack) {
+    joinMediaRoom(videoTrack)
+      .then((room) => {
+        mediaRoom = room;
+      })
+      .catch((error: unknown) => {
+        console.error("media room join failed:", error);
+      });
+  }
+  window.addEventListener("beforeunload", () => {
+    void mediaRoom?.disconnect();
+  });
 
   let lastVideoTime = -1;
   const tick = () => {
