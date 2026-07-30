@@ -19,6 +19,7 @@ python/
   proctor_fusion/     policy evaluation, temporal filtering  (no I/O)
   proctor_gateway/    FastAPI: ingest, integrity checks, proctor fan-out
   proctor_identity/   enrolment, face matching, temporal decision (no I/O)
+  proctor_audio/      transcription, intent classification, escalation (no I/O)
   proctor_sim/        headless candidates, honest and hostile
   tests/              behavioural + adversarial + conformance suites
 apps/client/src/
@@ -33,8 +34,8 @@ tools/
   conformance.ts            TS-signed frames for the Python verifier
 ```
 
-Planned, not yet built: `services/audio` (VAD → STT → intent),
-`services/media` (SFU + recording).
+Planned, not yet built: `services/media` (SFU + recording), client-side
+microphone capture and VAD (see § 5.5.4).
 
 ### 1.1 Why the schema is generated
 
@@ -376,6 +377,133 @@ currently holds only an opaque `candidate_ref`, and it carries its own
 retention, accuracy and discrimination questions. It should be scoped
 separately rather than folded in.
 
+## 5.5 Audio pipeline
+
+`python/proctor_audio/`. The edge already reports coarse voice-activity
+telemetry independently of this package — `signal.audio` in
+`proctor_protocol`, evaluated by the `sustained_speech` fusion rule — which
+answers "was the candidate talking". This package answers the harder
+question underneath it: transcribe sustained speech, and classify *why*
+someone was talking rather than just that they were.
+
+### 5.5.1 Why this is not the original project's keyword matching
+
+The original Proctoring-AI project stripped stopwords from the transcript
+and the exam paper and reported the overlap as a cheating signal. That
+fails in the direction that matters: "what is the answer to number four"
+shares almost no vocabulary with the question paper and passes straight
+through, while a candidate reading the question aloud to concentrate — not
+cheating — matches the paper's own wording and gets flagged for nothing.
+Keyword overlap measures lexical similarity, not intent.
+
+`KeywordIntentClassifier` exists to make that failure a runnable difference
+rather than a claim in a docstring — `test_audio.py` puts it side by side
+with the LLM-backed classifier on a paraphrase built to defeat a fixed
+trigger list, and the keyword double loses. It is never imported by
+`proctor_gateway`.
+
+### 5.5.2 Two gates, for two different risks
+
+Identity verification and the audio pipeline both fail closed on missing
+configuration, but on **different** provenance requirements, because they
+carry different legal exposure:
+
+- Identity's problem is **measurement accuracy** varying by population, so
+  it requires `identity_threshold` + `identity_calibrated_on` — a record of
+  what the cutoff was measured against.
+- Audio's dominant *additional* exposure is **consent**: recording and
+  transcribing a person's voice implicates wiretap and all-party-consent
+  statutes in the US and GDPR Art. 6/7 in a way a webcam frame comparison
+  does not. It requires `audio_consent_notice` — a record of what
+  candidates were told before their microphone was recorded.
+
+Within audio there is a second, independent tier. Consent gates
+*transcription itself* (the audio pipeline is enabled or it is not).
+Whether an LLM additionally judges intent is a separate switch
+(`Settings.llm_complete`, injected code, not an environment variable — this
+repository does not hardcode a call to any model vendor):
+
+| Consent notice | `llm_complete` | Behaviour |
+|---|---|---|
+| unset | — | `503`. No audio is transcribed at all. |
+| set | `None` | Transcripts are produced and stored for a human to read. No automated intent read. The coarse VAD-only `sustained_speech` rule still applies. |
+| set | injected | Transcripts *and* sustained-disagreement escalation to a hard flag. |
+
+### 5.5.3 One low frame is never enough, again
+
+Same discipline as identity verification: three of the last five
+classified chunks must read `seeking_help` before anything escalates
+(`AudioMonitorPolicy`, which refuses to be configured below two), and a
+malformed or unparsable LLM response becomes `unclear` — never
+`seeking_help` — because failing toward silence is the safe direction when
+the cost of a false positive is a person wrongly investigated.
+
+### 5.5.4 The privacy split, adapted
+
+Same shape as identity's template/score split, adapted to a different
+sensitivity profile: a transcript is not a biometric template, but it is
+*more* revealing in another way — it is the actual content of what was
+said, which can include third parties, health information, or anything
+else spoken near an open microphone.
+
+- **Raw transcripts** live on their own short clock
+  (`audio_transcript_retention_days`, default 1) in `audio_transcripts`.
+- **Classification labels and confidences** — the audit value — survive on
+  the ordinary long retention clock in `audio_checks`.
+- The violation raised on escalation embeds the labels, confidences and a
+  `transcript_ref`, and deliberately **not** the transcript text —
+  `_audio_violation` strips `transcript_excerpt` before persisting.
+  Baking the actual words into the long-retained violation record would
+  defeat the point of giving transcripts a shorter clock. The transcript
+  is fetchable separately, on demand, via
+  `GET /v1/proctor/sessions/{id}/audio/transcripts/{transcript_id}`, for as
+  long as it still exists — once purged, that endpoint 404s like any other
+  expired record, and the flag survives without the words.
+
+**Known gap:** the proctor console does not currently render violation
+evidence for *any* rule — fusion, identity, or audio. A `transcript_ref` in
+a flag's evidence is reachable via the API today but not yet through the
+UI. This predates the audio pipeline (identity's similarity scores have
+the same gap) and is worth closing before either feature is relied on for
+real review; it is a console data-model change, not an audio-specific one.
+
+### 5.5.5 Whisper is not bundled, but not because of its licence
+
+Unlike ArcFace, Whisper's code and model weights are released by OpenAI
+under the MIT licence, so vendoring a small model would not be a licence
+violation the way ArcFace weights would be. It is excluded from this
+repository anyway, for a practical reason: the runtime dependency
+(`faster-whisper`/ctranslate2, or `openai-whisper`/torch) is hundreds of
+megabytes, disproportionate for a feature that ships off by default.
+`WhisperTranscriber`'s error message says exactly this — it must not claim
+a licensing block that does not exist, because that claim would be false
+and this document has spent real effort being precise about which
+licences actually block what.
+
+### 5.5.6 Not built: client-side capture
+
+The blueprint this was built from calls for Silero VAD running locally in
+the browser/Electron renderer, with audio chunks uploaded only once
+sustained speech is detected. That client-side capture and VAD wiring is
+not built — this increment is the server-side pipeline (transcription,
+classification, temporal escalation, storage, retention, and the gateway
+endpoints), mirroring how identity verification's backend was built without
+also wiring an Electron enrolment-capture UI. Test coverage instead drives
+the gateway endpoints directly with base64 chunks, the same way the
+identity endpoints are tested.
+
+### 5.5.7 A discovered issue, fixed while building this
+
+Both `embedder.embed(...)` (identity) and, now, `transcriber.transcribe(...)`
+/ `intent_classifier.classify(...)` (audio) are synchronous calls that, with
+a real model behind them, are CPU-bound. Calling them directly inside an
+`async def` handler blocks FastAPI's event loop for that duration — for
+every other candidate's telemetry websocket, not just the one being
+processed. All four call sites now run through `asyncio.to_thread`. The
+identity endpoints had this latent issue already; it is fixed here rather
+than left for audio alone to get right, since leaving it asymmetric while
+noticing it would be negligent.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -412,8 +540,8 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 ## 8. Status
 
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
-client, proctor console, persistence, identity verification
-(157 Python + 29 TypeScript tests). The full chain has been run
+client, proctor console, persistence, identity verification, audio pipeline
+(197 Python + 29 TypeScript tests). The full chain has been run
 end-to-end against a synthetic camera feed in both the face-present and
 no-face cases; see `apps/client/scripts/e2e.mjs`.
 
@@ -428,7 +556,11 @@ thought of. Matching is now by exact basename with OS-vendor paths
 excluded, and a test runs against the real process table of whatever
 machine it is on.
 
-Not built: SFU and recording, audio pipeline, ID document capture (§5.4.3).
+Not built: SFU and recording, client-side microphone capture and VAD
+(§5.5.6), ID document capture (§5.4.3). Known gap: the proctor console does
+not render violation evidence for any rule yet (§5.5.4) — flags reach the
+board, but the supporting numbers and transcript references are only
+reachable via the API today.
 The proctor stream is now
 token-authenticated and fails closed, but there is still no per-proctor
 identity, no audit of who looked at whom, and no TLS termination here —

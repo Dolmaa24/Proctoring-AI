@@ -21,8 +21,18 @@ from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconne
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from proctor_audio import (
+    AudioIntentMonitor,
+    AudioMonitorPolicy,
+    AudioStatus,
+    DeterministicTranscriber,
+    IntentContext,
+    LLMIntentClassifier,
+    load_transcriber,
+)
 from proctor_fusion import FusionEngine, load_policy
 from proctor_identity import (
+    DeterministicEmbedder,
     EnrolmentError,
     IdentityStatus,
     IdentityVerifier,
@@ -127,6 +137,7 @@ class _Broadcast:
 
 
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_AUDIO_BYTES = 2 * 1024 * 1024
 
 _REPORTABLE_IDENTITY = {
     IdentityStatus.MISMATCH_SUSPECTED,
@@ -134,52 +145,100 @@ _REPORTABLE_IDENTITY = {
 }
 
 
-def _decode_image(image_b64: str) -> bytes:
+def _decode_base64(data: str, max_bytes: int, what: str) -> bytes:
     try:
-        raw = base64.b64decode(image_b64, validate=True)
+        raw = base64.b64decode(data, validate=True)
     except Exception as exc:
-        raise ValueError("capture is not valid base64") from exc
+        raise ValueError(f"{what} is not valid base64") from exc
     if not raw:
-        raise ValueError("capture is empty")
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError(f"capture exceeds {MAX_IMAGE_BYTES} bytes")
+        raise ValueError(f"{what} is empty")
+    if len(raw) > max_bytes:
+        raise ValueError(f"{what} exceeds {max_bytes} bytes")
     return raw
 
 
-def _identity_violation(session_id: str, finding: Any, now_ms: int) -> dict[str, Any]:
-    """Render an identity finding into the ordinary violation shape.
+def _flag_violation(
+    *,
+    session_id: str,
+    rule_id: str,
+    severity: str,
+    message: str,
+    now_ms: int,
+    evidence_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """The ordinary violation envelope, shared by identity and audio findings.
 
-    Reusing the violation record rather than inventing a parallel channel
-    means identity inherits everything already true of a flag: it reaches
-    the console, it lands in the audit trail and retention, and — the point
-    — it is `action: flag` with `requires_human_review: true` like every
-    other rule. Nothing here ends an exam.
+    Reusing this shape rather than inventing a parallel channel per feature
+    means every finding inherits everything already true of a flag: it
+    reaches the console, it lands in the audit trail and retention, and —
+    the point — it is always `action: flag` with `requires_human_review:
+    true`. Nothing that calls this ends an exam.
     """
-    hard = finding.status is IdentityStatus.MISMATCH_SUSPECTED
     return {
         "violation_id": str(uuid.uuid4()),
         "session_id": session_id,
-        "rule_id": ("identity_mismatch" if hard else "identity_unobservable"),
-        "severity": "hard" if hard else "info",
+        "rule_id": rule_id,
+        "severity": severity,
         "action": "flag",
         "requires_human_review": True,
-        "message": finding.message,
+        "message": message,
         "opened_at_ms": now_ms,
         "fired_at_ms": now_ms,
         "duration_ms": 0,
         "resolved": False,
-        # The similarities and the threshold they were judged against are
-        # the evidence. A reviewer needs "0.41 against 0.55, calibrated on
-        # X", not the word "mismatch".
         "evidence": [
             {
                 "server_ts_ms": now_ms,
                 "client_ts_ms": now_ms,
                 "seq": -1,
-                "payload": finding.as_dict(),
+                "payload": evidence_payload,
             }
         ],
     }
+
+
+def _identity_violation(session_id: str, finding: Any, now_ms: int) -> dict[str, Any]:
+    """Render an identity finding into the ordinary violation shape.
+
+    The similarities and the threshold they were judged against are the
+    evidence. A reviewer needs "0.41 against 0.55, calibrated on X", not
+    the word "mismatch".
+    """
+    hard = finding.status is IdentityStatus.MISMATCH_SUSPECTED
+    return _flag_violation(
+        session_id=session_id,
+        rule_id="identity_mismatch" if hard else "identity_unobservable",
+        severity="hard" if hard else "info",
+        message=finding.message,
+        now_ms=now_ms,
+        evidence_payload=finding.as_dict(),
+    )
+
+
+def _audio_violation(
+    session_id: str, finding: Any, transcript_id: str, now_ms: int
+) -> dict[str, Any]:
+    """Render an audio finding into the ordinary violation shape.
+
+    Note what is deliberately *absent* from the evidence: the transcript
+    text itself. `finding.transcript_excerpt` exists for the live console
+    view at flag-time, but the words a candidate spoke must not be baked
+    into the long-retained violation record — that would defeat the point
+    of giving transcripts their own short retention clock (see
+    `proctor_gateway.store`). The evidence carries labels, confidences and
+    a `transcript_ref`; the transcript itself is fetched separately, on
+    demand, for as long as it still exists.
+    """
+    payload = {k: v for k, v in finding.as_dict().items() if k != "transcript_excerpt"}
+    payload["transcript_ref"] = transcript_id
+    return _flag_violation(
+        session_id=session_id,
+        rule_id="audio_seeking_help",
+        severity="hard",
+        message=finding.message,
+        now_ms=now_ms,
+        evidence_payload=payload,
+    )
 
 
 class EnrolRequest(BaseModel):
@@ -194,6 +253,12 @@ class ProbeRequest(BaseModel):
     yaw_deg: float = 0.0
     pitch_deg: float = 0.0
     face_fraction: float = Field(default=0.3, ge=0.0, le=1.0)
+
+
+class AudioChunkRequest(BaseModel):
+    audio_b64: str
+    duration_ms: int = Field(ge=0, le=30_000)
+    exam_subject: str = ""
 
 
 class CreateSessionRequest(BaseModel):
@@ -228,6 +293,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     broadcast = _Broadcast(hub, board, settings, store)
     embedder = load_embedder(settings.face_model_path or None)
     verifier = _build_verifier(settings)
+    transcriber = load_transcriber(settings.audio_model_path or None)
+    intent_classifier = (
+        LLMIntentClassifier(settings.llm_complete, settings.llm_model_name)
+        if settings.llm_complete is not None
+        else None
+    )
+    audio_monitor = AudioIntentMonitor(
+        AudioMonitorPolicy(
+            window=settings.audio_help_window,
+            seeking_help_required=settings.audio_help_required,
+        )
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -238,11 +315,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # only applies to the database is not retention.
         _purge(store, settings)
         _purge_templates(store, settings)
+        _purge_transcripts(store, settings)
         restored = _restore(store, registry, board, engine, settings)
         if verifier is not None:
             _restore_templates(store, verifier, embedder)
         if restored:
             log.info("restored %d session(s) from %s", restored, settings.db_path)
+
+        # A feature "enabled" by its gate but backed by a test double is the
+        # worst of both worlds: it looks configured and does nothing real.
+        if verifier is not None and isinstance(embedder, DeterministicEmbedder):
+            log.warning(
+                "identity verification is enabled but PROCTOR_FACE_MODEL is unset; "
+                "using a test double that does NOT recognise faces. This must not "
+                "run in production."
+            )
+        if settings.audio_enabled and isinstance(transcriber, DeterministicTranscriber):
+            log.warning(
+                "the audio pipeline is enabled but PROCTOR_AUDIO_MODEL is unset; "
+                "using a test double that does NOT transcribe real audio. This "
+                "must not run in production."
+            )
         ticker = asyncio.create_task(_tick_loop(engine, broadcast, settings))
         log.info("gateway up: policy=%s rules=%d", policy.name, len(policy.rules))
         if not settings.has_persistent_secret:
@@ -406,7 +499,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="identity verification disabled")
 
         try:
-            embeddings = [embedder.embed(_decode_image(c)) for c in body.captures]
+            # Threaded: a real embedder's inference is CPU-bound, and a
+            # slow enrolment must not stall the event loop that is also
+            # serving every other candidate's telemetry websocket.
+            embeddings = [
+                await asyncio.to_thread(
+                    embedder.embed, _decode_base64(c, MAX_IMAGE_BYTES, "capture")
+                )
+                for c in body.captures
+            ]
             enrolment = build_enrolment(embeddings, verifier.match_policy)
         except EnrolmentError as exc:
             # 422, not 400: the request was well-formed, the captures were
@@ -454,7 +555,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         embedding = None
         if body.image_b64 and not quality.issues(verifier.match_policy.limits):
             try:
-                embedding = embedder.embed(_decode_image(body.image_b64))
+                raw = _decode_base64(body.image_b64, MAX_IMAGE_BYTES, "capture")
+                embedding = await asyncio.to_thread(embedder.embed, raw)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -483,6 +585,107 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "enabled": verifier is not None,
             "checks": store.load_identity_checks(session_id),
         }
+
+    @app.post("/v1/sessions/{session_id}/audio/chunk", status_code=201)
+    async def audio_chunk(session_id: str, body: AudioChunkRequest) -> dict[str, Any]:
+        """Transcribe one audio chunk and, if configured, classify its intent.
+
+        The raw audio is decoded, transcribed, and discarded in this
+        handler — it is never written to disk. What survives is the
+        transcript (short retention) and, if an intent classifier is
+        configured, the classification label (long retention). See
+        `proctor_gateway.store` for why those two live on different clocks.
+        """
+        session = registry.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        if not settings.audio_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="audio pipeline disabled: no consent notice configured",
+            )
+
+        try:
+            raw = _decode_base64(body.audio_b64, MAX_AUDIO_BYTES, "audio chunk")
+            # Threaded for the same reason as face embedding: a real
+            # transcriber's inference is CPU-bound and must not stall the
+            # event loop serving every other candidate's telemetry socket.
+            transcript = await asyncio.to_thread(transcriber.transcribe, raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        now = settings.clock()
+        transcript_id = str(uuid.uuid4())
+        store.save_transcript(
+            transcript_id, session_id, transcript, transcriber.name, body.duration_ms, now
+        )
+
+        response: dict[str, Any] = {
+            "transcript_id": transcript_id,
+            "transcript": transcript,
+            "classification": None,
+            "finding": None,
+        }
+
+        if intent_classifier is not None:
+            context = IntentContext(exam_subject=body.exam_subject)
+            classification = await asyncio.to_thread(
+                intent_classifier.classify, transcript, context
+            )
+            store.append_audio_check(
+                session_id,
+                transcript_id,
+                str(classification.label),
+                classification.confidence,
+                classification.classifier,
+                now,
+            )
+            finding = audio_monitor.record(session_id, classification, transcript)
+            response["classification"] = classification.as_dict()
+            response["finding"] = finding.as_dict() if finding else None
+
+            if finding is not None and finding.status is AudioStatus.SUSTAINED_HELP_SUSPECTED:
+                await broadcast.publish(
+                    {
+                        "kind": "violation",
+                        **_audio_violation(session_id, finding, transcript_id, now),
+                    }
+                )
+
+        return response
+
+    @app.get("/v1/proctor/sessions/{session_id}/audio")
+    async def audio_history(
+        session_id: str, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        _require_console_token(settings, _bearer(authorization))
+        return {
+            "session_id": session_id,
+            "enabled": settings.audio_enabled,
+            "intent_classification_enabled": intent_classifier is not None,
+            "checks": store.load_audio_checks(session_id),
+        }
+
+    @app.get("/v1/proctor/sessions/{session_id}/audio/transcripts/{transcript_id}")
+    async def audio_transcript(
+        session_id: str,
+        transcript_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Fetch a transcript referenced from a flag, while it still exists.
+
+        Deliberately absent from the violation record itself — see
+        `_audio_violation`. Once the transcript's own retention window
+        passes, this returns 404 like any other purged record: the flag
+        and its classification survive, the words do not.
+        """
+        _require_console_token(settings, _bearer(authorization))
+        record = store.load_transcript(transcript_id)
+        if record is None or record["session_id"] != session_id:
+            raise HTTPException(
+                status_code=404, detail="transcript not available (purged or unknown)"
+            )
+        return record
 
     @app.get("/v1/proctor/sessions")
     async def proctor_sessions(authorization: str | None = Header(default=None)):
@@ -531,6 +734,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.store = store
     app.state.verifier = verifier
     app.state.embedder = embedder
+    app.state.transcriber = transcriber
+    app.state.intent_classifier = intent_classifier
+    app.state.audio_monitor = audio_monitor
     app.state.settings = settings
     return app
 
@@ -682,6 +888,19 @@ def _purge_templates(store: Any, settings: Settings) -> None:
             "retention: removed %d face template(s) older than %d day(s)",
             removed,
             settings.template_retention_days,
+        )
+
+
+def _purge_transcripts(store: Any, settings: Settings) -> None:
+    if settings.audio_transcript_retention_days <= 0:
+        return
+    cutoff = settings.clock() - settings.audio_transcript_retention_days * 86_400_000
+    removed = store.purge_transcripts_older_than(cutoff)
+    if removed:
+        log.info(
+            "retention: removed %d audio transcript(s) older than %d day(s)",
+            removed,
+            settings.audio_transcript_retention_days,
         )
 
 

@@ -67,6 +67,7 @@ Drive a simulated candidate against it:
 | `apps/console` | Proctor console: triage queue, per-session audit timeline |
 | `proctor_gateway.store` | SQLite persistence + retention |
 | `proctor_identity` | Enrolment, face matching, temporal decision |
+| `proctor_audio` | Transcription, intent classification, temporal escalation |
 
 The full chain has been run end-to-end — camera → MediaPipe → IPC → signed
 WebSocket → gateway → fusion → proctor stream — against a synthetic camera
@@ -99,7 +100,38 @@ magnitude between demographic groups. **No face model is bundled**: the
 commonly available ArcFace weights are non-commercial-research-only.
 Point `PROCTOR_FACE_MODEL` at your own licensed ONNX export.
 
-Not yet built: SFU and recording, audio pipeline, ID document capture.
+The audio pipeline is built but **off by default**, gated on a different
+requirement than identity: not measurement accuracy, but *consent* —
+recording and transcribing a candidate's voice carries wiretap and
+all-party-consent exposure a webcam frame comparison does not.
+
+```bash
+PROCTOR_AUDIO_CONSENT_NOTICE="candidates shown recording notice X at exam start"
+```
+
+That alone enables transcription: chunks are transcribed and stored for a
+human to read, with no automated judgement on top. A second, independent
+switch adds intent classification — sustained "seeking outside help"
+escalates to a hard flag after three of the last five classified chunks
+agree, never on one. That switch is **code, not an environment variable**
+(`Settings(llm_complete=...)`): this repo does not hardcode a call to any
+model vendor, so wiring a real classifier means writing a small adapter
+around your own model client. See ARCHITECTURE.md § 5.5.2 for the full
+tier table.
+
+As with identity, no speech model is bundled — but unlike ArcFace, that is
+not a licensing block. Whisper's weights are MIT-licensed by OpenAI;
+they're excluded here because the dependency (torch or ctranslate2) is
+hundreds of megabytes for a feature that ships off by default. Point
+`PROCTOR_AUDIO_MODEL` at your own downloaded model.
+
+**Known gap:** the proctor console does not yet render violation evidence
+for any rule — the numbers behind a flag (similarity scores, a transcript
+reference) are reachable via the API but not the UI. Worth closing before
+either identity or audio findings are relied on for real review.
+
+Not yet built: SFU and recording, client-side microphone capture/VAD, ID
+document capture.
 
 ## Running the client
 
@@ -153,7 +185,7 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (157) and TypeScript (29). The suite has three parts, and the last
+Python (197) and TypeScript (29). The suite has three parts, and the last
 two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest

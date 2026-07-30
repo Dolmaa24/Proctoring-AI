@@ -102,6 +102,37 @@ CREATE TABLE IF NOT EXISTS identity_checks (
     recorded_ms   INTEGER NOT NULL
 );
 
+-- Audio: the same privacy split as identity, adapted. A transcript is far
+-- more revealing than a face-match float — it is the actual content of
+-- what was said, which can include third parties, health information, or
+-- anything else spoken near an open microphone — so it lives on its own
+-- short clock. The classification label and confidence carry the audit
+-- value and survive on the ordinary long clock.
+CREATE TABLE IF NOT EXISTS audio_transcripts (
+    transcript_id TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    transcript    TEXT NOT NULL,
+    transcriber   TEXT NOT NULL,
+    duration_ms   INTEGER NOT NULL,
+    recorded_ms   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audio_checks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    transcript_id TEXT NOT NULL,
+    label         TEXT NOT NULL,
+    confidence    REAL NOT NULL,
+    classifier    TEXT NOT NULL,
+    recorded_ms   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS transcripts_by_age
+    ON audio_transcripts (recorded_ms);
+CREATE INDEX IF NOT EXISTS audio_checks_by_session
+    ON audio_checks (session_id, recorded_ms);
+CREATE INDEX IF NOT EXISTS audio_checks_by_age
+    ON audio_checks (recorded_ms);
 CREATE INDEX IF NOT EXISTS templates_by_age
     ON identity_templates (created_ms);
 CREATE INDEX IF NOT EXISTS checks_by_session
@@ -163,6 +194,27 @@ class Store(Protocol):
     ) -> None: ...
     def load_identity_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]: ...
     def purge_templates_older_than(self, cutoff_ms: int) -> int: ...
+    def save_transcript(
+        self,
+        transcript_id: str,
+        session_id: str,
+        transcript: str,
+        transcriber: str,
+        duration_ms: int,
+        now_ms: int,
+    ) -> None: ...
+    def load_transcript(self, transcript_id: str) -> dict[str, Any] | None: ...
+    def append_audio_check(
+        self,
+        session_id: str,
+        transcript_id: str,
+        label: str,
+        confidence: float,
+        classifier: str,
+        now_ms: int,
+    ) -> None: ...
+    def load_audio_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]: ...
+    def purge_transcripts_older_than(self, cutoff_ms: int) -> int: ...
     def close(self) -> None: ...
 
 
@@ -210,6 +262,37 @@ class MemoryStore:
         return []
 
     def purge_templates_older_than(self, cutoff_ms: int) -> int:
+        return 0
+
+    def save_transcript(
+        self,
+        transcript_id: str,
+        session_id: str,
+        transcript: str,
+        transcriber: str,
+        duration_ms: int,
+        now_ms: int,
+    ) -> None:
+        return None
+
+    def load_transcript(self, transcript_id: str) -> dict[str, Any] | None:
+        return None
+
+    def append_audio_check(
+        self,
+        session_id: str,
+        transcript_id: str,
+        label: str,
+        confidence: float,
+        classifier: str,
+        now_ms: int,
+    ) -> None:
+        return None
+
+    def load_audio_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        return []
+
+    def purge_transcripts_older_than(self, cutoff_ms: int) -> int:
         return 0
 
     def close(self) -> None:
@@ -491,6 +574,95 @@ class SqliteStore:
             self._db.commit()
         return max(0, removed)
 
+    # -- audio ---------------------------------------------------------
+
+    def save_transcript(
+        self,
+        transcript_id: str,
+        session_id: str,
+        transcript: str,
+        transcriber: str,
+        duration_ms: int,
+        now_ms: int,
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO audio_transcripts (
+                    transcript_id, session_id, transcript, transcriber,
+                    duration_ms, recorded_ms
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                (transcript_id, session_id, transcript, transcriber, duration_ms, now_ms),
+            )
+            self._db.commit()
+
+    def load_transcript(self, transcript_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM audio_transcripts WHERE transcript_id = ?", (transcript_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "transcript_id": row["transcript_id"],
+            "session_id": row["session_id"],
+            "transcript": row["transcript"],
+            "transcriber": row["transcriber"],
+            "duration_ms": row["duration_ms"],
+            "recorded_ms": row["recorded_ms"],
+        }
+
+    def append_audio_check(
+        self,
+        session_id: str,
+        transcript_id: str,
+        label: str,
+        confidence: float,
+        classifier: str,
+        now_ms: int,
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO audio_checks (
+                    session_id, transcript_id, label, confidence, classifier,
+                    recorded_ms
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                (session_id, transcript_id, label, confidence, classifier, now_ms),
+            )
+            self._db.commit()
+
+    def load_audio_checks(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT * FROM audio_checks WHERE session_id = ?
+                ORDER BY recorded_ms DESC, id DESC LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [
+            {
+                "transcript_id": row["transcript_id"],
+                "label": row["label"],
+                "confidence": row["confidence"],
+                "classifier": row["classifier"],
+                "recorded_ms": row["recorded_ms"],
+            }
+            for row in rows
+        ]
+
+    def purge_transcripts_older_than(self, cutoff_ms: int) -> int:
+        """Expire transcripts on their own, shorter clock — see `save_transcript`."""
+        with self._lock:
+            removed = self._db.execute(
+                "DELETE FROM audio_transcripts WHERE recorded_ms < ?", (cutoff_ms,)
+            ).rowcount
+            self._db.commit()
+        return max(0, removed)
+
     # -- retention ---------------------------------------------------------
 
     def purge_older_than(self, cutoff_ms: int) -> tuple[int, int]:
@@ -506,6 +678,7 @@ class SqliteStore:
                 "DELETE FROM violations WHERE recorded_ms < ?", (cutoff_ms,)
             ).rowcount
             self._db.execute("DELETE FROM identity_checks WHERE recorded_ms < ?", (cutoff_ms,))
+            self._db.execute("DELETE FROM audio_checks WHERE recorded_ms < ?", (cutoff_ms,))
             sessions = self._db.execute(
                 "DELETE FROM sessions WHERE updated_ms < ?", (cutoff_ms,)
             ).rowcount

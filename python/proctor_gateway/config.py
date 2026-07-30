@@ -98,6 +98,63 @@ class Settings:
     Institutions with a shorter statutory limit should lower it.
     """
 
+    audio_model_path: str = ""
+    """Speech-to-text backend. Empty selects the deterministic test double.
+
+    Unlike `face_model_path`, an empty value here is not a licensing
+    workaround: Whisper's weights are MIT-licensed by OpenAI, and a real
+    model is simply not bundled to keep the base install light. See
+    `proctor_audio.transcription` for the full reasoning.
+    """
+
+    audio_consent_notice: str = ""
+    """A record that candidates were shown a specific notice before their
+    microphone was recorded and transcribed. Non-empty is required to
+    enable the audio pipeline at all.
+
+    This is a different gate from identity's, on purpose. Identity's
+    problem is measurement accuracy varying by population; audio's added
+    legal exposure is primarily *consent* — recording and transcribing a
+    person's voice implicates wiretap and all-party-consent statutes in
+    the US and GDPR Art. 6/7 in a way a webcam frame comparison does not.
+    Failing closed on a missing consent record follows the same logic as
+    failing closed on a missing calibration record: an unrecorded
+    justification is not a justification.
+    """
+
+    llm_complete: Callable[[str, str], str] | None = None
+    """Injected `(system_prompt, user_prompt) -> completion_text` for audio
+    intent classification. None disables outward-help detection entirely;
+    transcripts are still produced and shown to the proctor for human
+    judgement, and the coarse `sustained_speech` fusion rule (VAD-only,
+    keyword-free) still applies regardless.
+
+    Deliberately not configurable via environment variable: it is code, not
+    a value, and this repository does not hardcode a call to any specific
+    model vendor. Wiring a real classifier means writing a small adapter
+    around your own model client and constructing `Settings` with it
+    directly — see ARCHITECTURE.md § 5.5.
+    """
+
+    llm_model_name: str = ""
+    """Label recorded alongside audio classifications, e.g. "claude-x-2026-06".
+    Purely descriptive — for a reviewer to know what produced a finding."""
+
+    audio_help_window: int = 5
+    audio_help_required: int = 3
+    """See `proctor_audio.monitor.AudioMonitorPolicy` — the same sustained-
+    disagreement discipline as identity verification, applied to intent
+    classifications instead of face matches."""
+
+    audio_transcript_retention_days: int = 1
+    """How long raw transcripts are kept, separate from the classification
+    labels derived from them. Deliberately its own knob rather than reusing
+    `template_retention_days`: a spoken-word transcript and a face template
+    are both short-lived-by-design, but an institution's counsel may want
+    different windows for each, and coupling them would remove that choice
+    for no functional benefit.
+    """
+
     console_token: str = ""
     """Bearer token required to read the proctor stream.
 
@@ -135,6 +192,13 @@ class Settings:
             ),
             identity_calibrated_on=os.environ.get("PROCTOR_IDENTITY_CALIBRATED_ON", ""),
             template_retention_days=int(os.environ.get("PROCTOR_TEMPLATE_RETENTION_DAYS", "1")),
+            audio_model_path=os.environ.get("PROCTOR_AUDIO_MODEL", ""),
+            audio_consent_notice=os.environ.get("PROCTOR_AUDIO_CONSENT_NOTICE", ""),
+            audio_transcript_retention_days=int(
+                os.environ.get("PROCTOR_AUDIO_TRANSCRIPT_RETENTION_DAYS", "1")
+            ),
+            # llm_complete is intentionally absent here: it is code, not an
+            # environment value. See its docstring.
         )
 
     @property
@@ -150,6 +214,18 @@ class Settings:
         and it is not.
         """
         return self.identity_threshold is not None and bool(self.identity_calibrated_on.strip())
+
+    @property
+    def audio_enabled(self) -> bool:
+        """The audio pipeline runs only when a consent record exists.
+
+        Transcription and the coarse VAD-only `sustained_speech` rule are
+        independent of the LLM classifier: consent gates transcription
+        itself, since transcribing speech is the action with wiretap/consent
+        exposure. `llm_complete` being unset just means transcripts are
+        surfaced to a human without an automated intent read on top.
+        """
+        return bool(self.audio_consent_notice.strip())
 
     @property
     def has_configured_console_token(self) -> bool:
