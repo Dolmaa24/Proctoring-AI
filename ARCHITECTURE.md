@@ -950,22 +950,37 @@ against process names someone had thought of. Matching is now by exact
 basename with OS-vendor paths excluded, and a test runs against the real
 process table of whatever machine it is on.
 
-**A known, unfixed issue, also found by running the real chain rather
-than by inspection:** `apps/client/scripts/e2e.mjs`'s own
-`report()` currently shows `stream_sequence_gap`/`stream_replay` firing
-against an honest client — the gateway is correctly detecting that frames
-sometimes arrive out of sequence order, but the client, not an attacker,
-is the cause. `TelemetryClient.emit()` (`telemetry.ts`) assigns a frame's
-sequence number synchronously, then signs it asynchronously before
-sending; the renderer's detection loop fires several observations per
-tick without awaiting each other, so two overlapping `emit()` calls can
-have their signing resolve in the opposite order their sequence numbers
-were assigned in, and whichever finishes signing first is sent first.
-Confirmed present on this codebase before the media-plane work in this
-section (reproduced identically against commit `144638b` in an isolated
-worktree), so it predates and is unrelated to §5.6 — flagged rather than
-folded into that work, since fixing a send-ordering guarantee correctly
-deserves its own focused change, not a bolt-on to an unrelated feature.
+**A send-ordering race, found by running the real chain rather than by
+inspection — now fixed.** `apps/client/scripts/e2e.mjs` showed
+`stream_sequence_gap`/`stream_replay` firing against an honest client:
+the gateway was correctly detecting frames arriving out of sequence
+order, but the client, not an attacker, was the cause.
+`TelemetryClient.emit()` assigned a frame's sequence number
+synchronously, then signed it asynchronously before sending. The
+renderer's detection loop fires several observations per tick without
+awaiting each other, so two overlapping `emit()` calls could have their
+signing resolve in the opposite order their sequence numbers were
+assigned in, and whichever finished signing first was sent first. The
+client was flagging itself for the one attack that counter exists to
+detect.
+
+`emit` now chains dispatch on the previous frame, so frames reach the
+socket in sequence order while signing still overlaps; `close` drains
+the chain, since dropping frames mid-signature at shutdown would
+manufacture the same gap on the exit path. Three consecutive
+twelve-second end-to-end runs at ~90 samples each now report no
+integrity breaches, where the race previously fired on two runs in
+three at that throughput.
+
+Two things about this are worth keeping in mind rather than filing away.
+First, it was invisible to unit tests by construction: with a
+well-behaved signer the ordering is correct by luck, so the regression
+tests inject a signer that resolves in reverse order on purpose.
+Second, `telemetry.ts` had no unit tests at all, because its constructor
+used TypeScript parameter properties and Node's `--experimental-strip-types`
+refuses them — the module could not be loaded by the test runner. That is
+a reminder that "no tests" is sometimes a toolchain fact rather than a
+choice, and worth checking for directly.
 
 Not built: a browser-extension form factor — an extension can do camera
 inference, fullscreen, tab focus and keystroke capture, but cannot

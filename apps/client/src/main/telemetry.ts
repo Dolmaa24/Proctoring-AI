@@ -37,14 +37,52 @@ export class TelemetryClient {
   #closed = false;
   #dropped = 0;
 
+  /**
+   * Tail of the dispatch chain. Every frame waits on the previous one
+   * before it reaches the socket — see `emit`.
+   */
+  #tail: Promise<void> = Promise.resolve();
+
+  // Written out as fields rather than constructor parameter properties.
+  // Node's --experimental-strip-types refuses parameter properties, so
+  // that shorthand made this whole module unloadable by the test runner —
+  // which is a large part of why the ordering bug below reached
+  // production with no unit test in its way.
+  readonly #baseUrl: string;
+  readonly #enrolment: Enrolment;
+  readonly #importKey: (b64: string) => Promise<CryptoKey>;
+  readonly #sign: (envelope: Envelope, key: CryptoKey) => Promise<string>;
+
   constructor(
-    private readonly baseUrl: string,
-    private readonly enrolment: Enrolment,
-    private readonly importKey: (b64: string) => Promise<CryptoKey>,
-  ) {}
+    baseUrl: string,
+    enrolment: Enrolment,
+    importKey: (b64: string) => Promise<CryptoKey>,
+    /**
+     * Injected for the same reason `importKey` is: the ordering guarantee
+     * in `emit` is only testable if a test can make signing resolve out of
+     * order on purpose, which is exactly the case that broke in
+     * production.
+     */
+    sign: (envelope: Envelope, key: CryptoKey) => Promise<string> = signEnvelope,
+  ) {
+    this.#baseUrl = baseUrl;
+    this.#enrolment = enrolment;
+    this.#importKey = importKey;
+    this.#sign = sign;
+  }
 
   get droppedFrames(): number {
     return this.#dropped;
+  }
+
+  /**
+   * Frames signed but not yet on the wire, oldest first.
+   *
+   * Diagnostic, like `droppedFrames`: a queue that only grows is the
+   * visible symptom of a socket that reconnects but never drains.
+   */
+  get pending(): readonly string[] {
+    return this.#queue;
   }
 
   get connected(): boolean {
@@ -52,7 +90,7 @@ export class TelemetryClient {
   }
 
   async start(): Promise<void> {
-    this.#key = await this.importKey(this.enrolment.session_key_b64);
+    this.#key = await this.#importKey(this.#enrolment.session_key_b64);
     // Monotonic from here. `performance.now()` is immune to wall-clock
     // changes, which matters because the gateway rejects a monotonic
     // counter that moves backwards — using Date.now() would make an
@@ -74,16 +112,35 @@ export class TelemetryClient {
 
     const monotonic = Math.round(performance.now() - this.#startedAt);
     const envelope: Envelope = {
-      v: this.enrolment.protocol_version,
-      session_id: this.enrolment.session_id,
+      v: this.#enrolment.protocol_version,
+      session_id: this.#enrolment.session_id,
       seq: this.#seq++,
       ts_client_ms: Date.now(),
       ts_monotonic_ms: monotonic,
       payload,
     };
 
-    const frame = await signEnvelope(envelope, this.#key);
+    // Sequence numbers are handed out synchronously above, but signing is
+    // async — so without this chain two overlapping `emit` calls race, and
+    // whichever finishes signing first reaches the socket first. The
+    // gateway treats a frame arriving after a higher sequence number as a
+    // replay attempt, which meant an honest client under load flagged
+    // itself for the one attack this counter exists to detect.
+    //
+    // Signing still overlaps; only dispatch is ordered. `catch` keeps one
+    // failed frame from wedging every frame queued behind it.
+    const key = this.#key;
+    const previous = this.#tail;
+    const mine = (async () => {
+      const frame = await this.#sign(envelope, key);
+      await previous;
+      this.#dispatch(frame);
+    })();
+    this.#tail = mine.catch(() => undefined);
+    return mine;
+  }
 
+  #dispatch(frame: string): void {
     if (this.connected) {
       this.#socket!.send(frame);
       return;
@@ -101,6 +158,11 @@ export class TelemetryClient {
   }
 
   async close(): Promise<void> {
+    // Drain before marking closed: frames already mid-signature still have
+    // sequence numbers the gateway is expecting, and dropping them here
+    // would manufacture the exact gap this class works to avoid — on the
+    // shutdown path, where `session_end` makes it look deliberate.
+    await this.#tail;
     this.#closed = true;
     await this.#flush();
     this.#socket?.close(1000, "session ended");
@@ -125,7 +187,7 @@ export class TelemetryClient {
 
   #connectOnce(): Promise<void> {
     const url =
-      this.baseUrl.replace(/^http/, "ws") + this.enrolment.telemetry_url;
+      this.#baseUrl.replace(/^http/, "ws") + this.#enrolment.telemetry_url;
 
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(url);

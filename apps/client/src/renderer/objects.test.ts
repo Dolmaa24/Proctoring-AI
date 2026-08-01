@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { detectionsToSignals, personCount } from "./objects.ts";
+import { COCO_TO_LABEL, detectionsToSignals, personCount } from "./objects.ts";
 
 type Detection = Parameters<typeof detectionsToSignals>[0][number];
 
@@ -95,4 +95,33 @@ test("personCount counts only confident people", () => {
     detection("cell phone", 0.9),
   ];
   assert.equal(personCount(detections), 2);
+});
+
+/**
+ * The other half of python/tests/test_policy_object_labels.py.
+ *
+ * That suite asserts the shipped policy never matches on a label nothing
+ * can emit; this one pins what this detector actually emits, so the two
+ * cannot drift apart silently. `smartwatch` and `headphones` are absent
+ * on purpose — COCO-80 has no such classes — and `wearable_detected` in
+ * policies/default.yaml is inert as a result. Adding either here without
+ * a detector that genuinely produces it would make that policy rule look
+ * live while still never firing.
+ */
+test("the COCO mapping emits exactly the labels declared detectable", () => {
+  assert.deepEqual(
+    [...new Set(Object.values(COCO_TO_LABEL))].sort(),
+    ["book", "person", "phone"],
+    "keep in step with DETECTABLE_LABELS in python/proctor_protocol/events.py",
+  );
+});
+
+test("no COCO category maps to a wearable label", () => {
+  const wearables = new Set(["smartwatch", "headphones"]);
+  const mapped = Object.entries(COCO_TO_LABEL).filter(([, label]) => wearables.has(label));
+  assert.deepEqual(
+    mapped,
+    [],
+    "COCO-80 has no smartwatch or headphones class; a mapping here would be a guess",
+  );
 });

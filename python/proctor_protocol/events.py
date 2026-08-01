@@ -48,6 +48,35 @@ class ObjectLabel(StrEnum):
     BOOK = "book"
 
 
+DETECTABLE_LABELS: frozenset[ObjectLabel] = frozenset(
+    {ObjectLabel.PHONE, ObjectLabel.PERSON, ObjectLabel.BOOK}
+)
+"""Labels a detector shipped with this project can actually produce.
+
+The bundled detector is EfficientDet-Lite0 over COCO-80, chosen because
+it is Apache-2.0 and runs in the MediaPipe runtime already vendored for
+the face landmarker (Ultralytics YOLO is AGPL-3.0 — ARCHITECTURE.md § 7).
+COCO-80 contains `cell phone`, `person` and `book`.
+"""
+
+UNDETECTABLE_LABELS: frozenset[ObjectLabel] = frozenset(
+    {ObjectLabel.SMARTWATCH, ObjectLabel.HEADPHONES}
+)
+"""Labels the protocol defines that no shipped detector can emit.
+
+COCO-80 has no smartwatch class and no headphones class, so any rule
+matching on these is inert: structurally valid, evaluated on every
+`signal.object`, and incapable of ever matching. `wearable_detected` in
+policies/default.yaml is exactly that.
+
+Kept as a named set rather than deleted so the gap is checkable instead
+of merely commented — see `test_policy_object_labels`. A prose note in
+one file drifts silently; a test fails. Supplying a detector trained on
+these classes means moving them into `DETECTABLE_LABELS`, and the tests
+on both sides of the protocol will tell you what else needs to change.
+"""
+
+
 class BoundingBox(_Frozen):
     """Normalised to [0, 1] against the frame, origin top-left."""
 

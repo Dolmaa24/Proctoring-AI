@@ -124,8 +124,25 @@ rules:
     cooldown_ms: 20000
     min_confidence: 0.75
 
+  # INERT: this rule cannot currently fire, and that is a known gap, not
+  # an oversight. The bundled detector is EfficientDet-Lite0 over COCO-80,
+  # which has no smartwatch class and no headphones class, so no
+  # `signal.object` will ever carry these labels. It is kept here because
+  # deleting it would erase the intent along with the gap — a reviewer
+  # should be able to see what this policy means to cover as well as what
+  # it covers today.
+  #
+  # This is not left to a comment to enforce: DETECTABLE_LABELS /
+  # UNDETECTABLE_LABELS in python/proctor_protocol/events.py name the
+  # split, and python/tests/test_policy_object_labels.py fails if another
+  # inert rule appears, if a rule mixes reachable and unreachable labels,
+  # or if this gap closes without the docs following.
+  #
+  # To make it live: supply a detector trained on these classes, map them
+  # in apps/client/src/renderer/objects.ts, and move the labels into
+  # DETECTABLE_LABELS. The tests will tell you what else needs updating.
   - id: wearable_detected
-    description: A smartwatch or headphones were detected.
+    description: A smartwatch or headphones were detected (INERT — see note above).
     signal: signal.object
     when:
       all_of:

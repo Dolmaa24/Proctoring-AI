@@ -6,7 +6,9 @@ than hand-maintained, so the two halves cannot drift.
 """
 
 from .events import (
+    DETECTABLE_LABELS,
     PROTOCOL_VERSION,
+    UNDETECTABLE_LABELS,
     Attestation,
     AudioSignal,
     BoundingBox,
@@ -50,6 +52,8 @@ __all__ = [
     "LivenessSignal",
     "LockdownEvent",
     "LockdownSignal",
+    "DETECTABLE_LABELS",
+    "UNDETECTABLE_LABELS",
     "ObjectLabel",
     "ObjectSignal",
     "Payload",

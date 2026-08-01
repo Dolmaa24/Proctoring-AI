@@ -25,6 +25,13 @@
  * with nothing feeding it is deliberate: removing it would hide the gap,
  * and a reviewer reading the policy should be able to see what is intended
  * as well as what currently works.
+ *
+ * That claim is enforced, not just written down. `DETECTABLE_LABELS` and
+ * `UNDETECTABLE_LABELS` in python/proctor_protocol/events.py name the
+ * split; the tests beside this file assert this mapping matches the
+ * former, and python/tests/test_policy_object_labels.py asserts the
+ * policy never quietly grows a second inert rule. A comment on its own
+ * would have gone stale the first time someone swapped the model.
  */
 
 import { FilesetResolver, ObjectDetector, type Detection } from "@mediapipe/tasks-vision";
@@ -39,7 +46,7 @@ import type { BoundingBox, ObjectLabel, ObjectSignal } from "../protocol/events.
  * the model was never evaluated on, and a loose mapping here would defeat
  * that by quietly admitting whatever COCO happens to call something.
  */
-const COCO_TO_LABEL: Record<string, ObjectLabel> = {
+export const COCO_TO_LABEL: Record<string, ObjectLabel> = {
   "cell phone": "phone",
   person: "person",
   book: "book",

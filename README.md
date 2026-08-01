@@ -7,10 +7,12 @@ and evidence. Raw video never touches the telemetry path.
 Rebuilt from scratch. The original OpenCV desktop scripts are preserved on
 the `upstream/master` remote for reference.
 
-> **Not production ready.** See ARCHITECTURE.md § 8 for the full list —
-> including a known telemetry send-ordering issue that can raise a false
-> replay flag against an honest client — and § 3.2 for a documented,
-> unclosed gap in clock-stretch detection.
+> **Not production ready.** See ARCHITECTURE.md § 8 for the full list of
+> what is and is not built, and § 3.2 for a documented, unclosed gap in
+> clock-stretch detection. Note also that `wearable_detected` in the
+> shipped policy is inert by design — the bundled COCO-80 detector has no
+> smartwatch or headphones class — and is kept, and tested as inert, so
+> the gap stays visible rather than silently disappearing.
 
 ---
 
