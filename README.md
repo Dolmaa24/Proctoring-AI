@@ -330,14 +330,25 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (279, plus 19 that need Postgres — see below) and TypeScript (56).
+Python (286, plus 19 that need Postgres — see below) and TypeScript (61).
 The store tests run the same assertions against both SQLite and Postgres,
 since a behaviour that holds in one and not the other is a bug that
-otherwise only surfaces in whichever environment is less tested:
+otherwise only surfaces in whichever environment is less tested.
+
+Point them at a database of their own, not the one the stack is using:
 
 ```bash
-PROCTOR_TEST_POSTGRES_DSN=postgresql://proctor:PASSWORD@localhost:5433/proctor .venv/bin/python -m pytest python/tests/test_store_backends.py -q
+docker compose exec postgres psql -U proctor -d postgres -c "CREATE DATABASE proctor_test OWNER proctor;"
 ```
+
+```bash
+PROCTOR_TEST_POSTGRES_DSN=postgresql://proctor:PASSWORD@localhost:5433/proctor_test .venv/bin/python -m pytest python/tests/test_store_backends.py -q
+```
+
+The separate database is not fastidiousness. These tests `TRUNCATE` every
+table they touch, because a leftover row from an earlier test would make
+failures depend on execution order — so aiming them at `proctor` deletes
+whatever sessions and violations the stack has recorded.
 
 They skip cleanly when that variable is unset, so a laptop without Docker
 still gets a green suite. The rest of the suite has three parts, and the last
