@@ -1,0 +1,152 @@
+# Full local stack: gateway, Postgres, a database browser, and a real
+# self-hosted LiveKit + egress so recording works end to end.
+#
+#   cp .env.example .env      # then edit it — see the comments in that file
+#   docker compose up -d
+#
+#   gateway   http://localhost:8000        console at /console
+#   adminer   http://localhost:8080        browse sessions by hand
+#   livekit   ws://localhost:7880
+#   recordings ./data/recordings           written by egress, readable directly
+#
+# This is a *development and evaluation* stack. It terminates no TLS, its
+# defaults are weak on purpose so it starts without ceremony, and Postgres
+# is exposed on a host port so you can point psql at it. Do not put it on a
+# public network as-is; ARCHITECTURE.md § 8 lists what is still missing
+# before this is deployable (per-proctor identity, an access audit, TLS).
+
+name: proctoring-ai
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-proctor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-proctor}
+    volumes:
+      # Named volume, not a bind mount: the audit trail should survive
+      # `docker compose down` and a host filesystem it does not control.
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Exposed so you can reach it with psql or any client directly —
+      # this is the "accessible manually" requirement, and Adminer below
+      # is the same thing with a UI.
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-proctor} -d ${POSTGRES_DB:-proctor}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  adminer:
+    image: adminer:5
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    # LiveKit's egress service coordinates through Redis; the server alone
+    # does not need it, but recording does.
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./deploy/livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}"
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      # WebRTC media. UDP, and a range rather than one port because each
+      # participant connection takes its own.
+      - "50000-50019:50000-50019/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  egress:
+    image: livekit/egress:latest
+    restart: unless-stopped
+    environment:
+      # Passed as a config *body* rather than a file. Egress needs the API
+      # key and secret to authenticate back to LiveKit, and neither it nor
+      # the LiveKit server expands ${VARS} inside a mounted config file —
+      # without the secret every recording fails with the genuinely
+      # misleading "request has missing or invalid field: token or api
+      # key/secret", which reads like the caller's token is wrong rather
+      # than egress's own. Compose does expand variables here.
+      #
+      # deploy/egress.yaml is kept as the documented reference for the
+      # non-secret settings.
+      EGRESS_CONFIG_BODY: |
+        redis:
+          address: redis:6379
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ws://livekit:7880
+        file_output:
+          local: true
+        log_level: info
+    volumes:
+      # Bind mount, unlike Postgres: the whole point of the recordings is
+      # that a human can retrieve the file afterwards, so it lands
+      # somewhere obvious on the host rather than inside a named volume.
+      - ./data/recordings:/out
+    # Chrome inside the egress container needs a larger shm than Docker's
+    # 64MB default or it crashes partway through a recording.
+    shm_size: 1gb
+    # Egress composites the room in a headless Chrome, which needs
+    # SYS_ADMIN for its sandbox.
+    cap_add:
+      - SYS_ADMIN
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+
+  gateway:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    environment:
+      PROCTOR_MASTER_SECRET: ${PROCTOR_MASTER_SECRET:?set PROCTOR_MASTER_SECRET in .env}
+      PROCTOR_CONSOLE_TOKEN: ${PROCTOR_CONSOLE_TOKEN:-}
+      PROCTOR_DB_PATH: postgresql://${POSTGRES_USER:-proctor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-proctor}
+      # Two addresses, because the gateway and a candidate's browser reach
+      # LiveKit from different networks: `livekit` is a compose service
+      # name that resolves nowhere outside this network.
+      PROCTOR_LIVEKIT_URL: ${PROCTOR_LIVEKIT_URL:-ws://livekit:7880}
+      PROCTOR_LIVEKIT_PUBLIC_URL: ${PROCTOR_LIVEKIT_PUBLIC_URL:-ws://localhost:7880}
+      PROCTOR_LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      PROCTOR_LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      PROCTOR_MEDIA_CONSENT_NOTICE: ${PROCTOR_MEDIA_CONSENT_NOTICE:-}
+      PROCTOR_AUDIO_CONSENT_NOTICE: ${PROCTOR_AUDIO_CONSENT_NOTICE:-}
+      PROCTOR_RETENTION_DAYS: ${PROCTOR_RETENTION_DAYS:-30}
+      PROCTOR_RECORDING_RETENTION_DAYS: ${PROCTOR_RECORDING_RETENTION_DAYS:-14}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+
+volumes:
+  postgres-data:

@@ -32,3 +32,6 @@ proctor.db
 proctor.db-wal
 proctor.db-shm
 *.db
+
+# Docker stack: local secrets and recorded sessions.
+data/

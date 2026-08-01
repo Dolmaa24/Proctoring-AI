@@ -1,0 +1,50 @@
+# LiveKit server, configured for the local compose stack.
+#
+# Keys are supplied through the LIVEKIT_KEYS environment variable in
+# docker-compose.yml rather than written here, so that a secret does not
+# end up in a file that gets committed.
+
+port: 7880
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50019
+  # The compose stack runs on one host with published ports, so LiveKit
+  # should advertise the host address rather than its container IP.
+  use_external_ip: false
+
+redis:
+  address: redis:6379
+
+# Rooms close on their own once empty. Without this a candidate who
+# disconnects leaves a room — and any egress attached to it — running.
+room:
+  empty_timeout: 60
+  departure_timeout: 20
+
+# Recording is started by the gateway when a room actually starts, not
+# when the candidate presses "I agree": at consent time nobody has joined
+# yet and there is no room to record, which LiveKit answers with
+# "requested room does not exist". Driving it from the room lifecycle also
+# means a candidate who reconnects gets a recording without anything
+# having to retry.
+#
+# `api_key` names one of the keys in LIVEKIT_KEYS; LiveKit signs each
+# delivery with that key's *secret*, and the gateway verifies against
+# PROCTOR_LIVEKIT_API_KEY / PROCTOR_LIVEKIT_API_SECRET. If the two
+# disagree the gateway answers 401 and no recording ever starts.
+#
+# Hardcoded rather than `${LIVEKIT_API_KEY}`: LiveKit does not expand
+# environment variables inside this file — it reads the literal string and
+# fails with "api_key is required to use webhooks". The value is an
+# identifier, not a secret (the secret is LIVEKIT_API_SECRET, which is not
+# in this file), so committing it is fine. If you change LIVEKIT_API_KEY
+# in .env, change it here too.
+webhook:
+  api_key: proctor
+  urls:
+    - http://gateway:8000/v1/media/webhook
+
+logging:
+  level: info

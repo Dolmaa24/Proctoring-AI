@@ -1,0 +1,34 @@
+# LiveKit egress: records rooms to files on disk.
+#
+# REFERENCE ONLY — this file is not mounted. The live configuration is
+# EGRESS_CONFIG_BODY in docker-compose.yml, because egress needs the API
+# key and secret and does not expand ${VARS} inside a config file, so a
+# mounted file could not carry them without committing a secret. This file
+# documents the non-secret settings and why they are what they are.
+#
+# Deliberately configured for local filesystem output rather than S3. The
+# requirement this stack exists for is that a person can retrieve a
+# session recording by hand, and a file under ./data/recordings on the
+# host is the shortest path to that. Swapping in object storage means
+# replacing `file_output` here with an `s3:` block and giving egress the
+# credentials — the gateway does not handle storage credentials itself
+# either way, which is the boundary described in
+# proctor_media.provider.
+#
+# API key and secret must match the LiveKit server's. They are read from
+# the environment in docker-compose.yml.
+
+redis:
+  address: redis:6379
+
+ws_url: ws://livekit:7880
+
+# Written into the container's /out, which is bind-mounted to
+# ./data/recordings on the host.
+file_output:
+  local: true
+
+# The default is a composited view of the room, which is what a reviewer
+# wants: one file per session showing the candidate, rather than a
+# separate track file per participant to reassemble later.
+log_level: info

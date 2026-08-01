@@ -184,6 +184,42 @@ def test_malformed_json_body_is_rejected_even_if_the_hash_matches():
         verify_webhook(body, header, CREDS)
 
 
+def test_an_egress_event_takes_its_room_name_from_egress_info():
+    """Egress webhooks carry no top-level `room` object.
+
+    Verified against a real LiveKit 1.13 delivery: `egress_started` and
+    `egress_ended` put the room inside `egressInfo.roomName`. Reading only
+    `room.name` left every egress event with an empty room name, which
+    silently broke deriving the session from it — the recording started
+    but its status never advanced past `requested`.
+    """
+    body = json.dumps(
+        {
+            "event": "egress_started",
+            "egressInfo": {
+                "egressId": "EG_abc",
+                "roomName": "proctor-sess-123",
+                "status": "EGRESS_ACTIVE",
+            },
+        }
+    ).encode()
+    event = verify_webhook(body, sign_webhook(body), CREDS)
+    assert event.room_name == "proctor-sess-123"
+    assert event.egress_id == "EG_abc"
+
+
+def test_a_top_level_room_still_wins_when_both_are_present():
+    body = json.dumps(
+        {
+            "event": "room_started",
+            "room": {"name": "proctor-sess-top"},
+            "egressInfo": {"egressId": "EG_x", "roomName": "proctor-sess-nested"},
+        }
+    ).encode()
+    event = verify_webhook(body, sign_webhook(body), CREDS)
+    assert event.room_name == "proctor-sess-top"
+
+
 def test_webhook_missing_optional_egress_fields_parses_cleanly():
     body = json.dumps({"event": "room_started", "room": {"name": "r"}}).encode()
     event = verify_webhook(body, sign_webhook(body), CREDS)

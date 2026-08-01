@@ -149,7 +149,11 @@ class WebhookEvent:
         storage_ref = file_results[0].get("location") if file_results else None
         return cls(
             event=payload.get("event", ""),
-            room_name=room.get("name", ""),
+            # `egress_started`/`egress_ended` carry no top-level `room`
+            # object — the room is inside egressInfo. Reading only
+            # `room.name` left every egress event with an empty room name,
+            # which silently broke deriving the session from it.
+            room_name=room.get("name") or egress.get("roomName") or "",
             egress_id=egress.get("egressId"),
             egress_status=egress.get("status"),
             storage_ref=storage_ref,
@@ -162,14 +166,17 @@ def verify_webhook(
 ) -> WebhookEvent:
     """Verify a LiveKit webhook POST and parse it.
 
-    LiveKit signs webhooks with a JWT carried in a custom `Authorize`
-    header (not the standard `Authorization` header — easy to get wrong,
-    confirm against your deployment) whose payload commits to a hash of
+    LiveKit signs webhooks with a JWT whose payload commits to a hash of
     the exact request body: `sha256` = base64(SHA-256(body)). Verification
     is therefore two checks, both required: the JWT signature (proves the
     sender holds the API secret) and the body hash (proves this exact
     payload, unmodified, is what was signed) — checking only the first
     would accept a valid signature attached to a swapped-in body.
+
+    The caller supplies the header value. Verified against LiveKit 1.13:
+    the token arrives in `Authorization` as a bare JWT with no `Bearer `
+    prefix. Older releases used `Authorize`, so the gateway reads
+    whichever is present.
     """
     if not authorize_header:
         raise TokenError("missing Authorize header")

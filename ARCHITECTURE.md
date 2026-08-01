@@ -715,6 +715,163 @@ destinations are broadened, not script execution — verified live: a
 `wss://` URL is correctly allowed through to attempt (and, against no
 real server, correctly fail) its connection.
 
+## 5.7 The exam shell: consent, detection, lockdown
+
+### 5.7.1 Consent is a gate, not a banner
+
+Nothing is captured before the candidate accepts. The camera is not
+opened, no model is loaded, and no signal is emitted until the button in
+`consent.ts` is pressed. This ordering is the whole point: a disclaimer
+displayed while the webcam light is already on is *notification*, and
+notification and consent are not interchangeable.
+
+The dialog names every capture individually — camera and what is inferred
+from it, microphone, recording and its retention window, process and
+display checks, and the lockdown allowance. "Your session is monitored"
+is the kind of sentence written to avoid alarming people, and it leaves a
+candidate genuinely unaware that a video file is being kept.
+
+There is deliberately **no decline button**. This shell cannot offer a
+meaningful alternative — the exam does not proceed either way — and a
+decline button that closes the app would dress an institutional
+requirement up as a free choice. The candidate declines by closing the
+window, which is honest about what declining costs them. An institution
+deploying this owes them a real route to an unproctored alternative; that
+route is not something a dialog can provide.
+
+Consent reaches the server twice, on purpose. The client's *main* process
+emits an `exam_start` lifecycle event on the signed telemetry stream —
+ordered and tamper-evident alongside every observation — and separately
+POSTs `/v1/sessions/{id}/consent` so the gateway learns about it without
+having to parse the telemetry stream for control flow. The renderer does
+neither directly: main rejects any payload from it that is not a
+`signal.*`, because a renderer able to originate arbitrary lifecycle
+phases could claim `identity_verified`.
+
+### 5.7.2 Recording follows the room, not the click
+
+The obvious implementation — start recording when consent is granted —
+does not work, and the reason is worth recording because it is not
+obvious from the outside. At the moment consent is given the candidate
+has not joined the media room yet (the dialog is shown *before* the
+camera opens, per § 5.7.1), so there is no room to record and LiveKit
+answers `requested room does not exist`.
+
+Recording is therefore started from LiveKit's `room_started` webhook.
+That also means a candidate who drops and reconnects gets a recording
+without any retry logic, and it keeps the candidate's client unable to
+start or stop a recording — those endpoints stay proctor-only.
+
+Two races had to be handled, both found by running the real stack rather
+than by reading the code:
+
+- `egress_started` routinely arrives *before* the gateway's own
+  `StartRoomCompositeEgress` call returns and writes its row. Both paths
+  now key the row on the egress id, and whichever lands first wins; the
+  other finds the existing row instead of duplicating it or walking the
+  status backwards.
+- `room_started` can be delivered more than once. Starting a second
+  egress for a session that already has a live one would produce two
+  files and two rows for one exam, so the start path is idempotent per
+  session.
+
+### 5.7.3 Object and frame-quality detection
+
+Object detection uses MediaPipe's EfficientDet-Lite0 (Apache-2.0), which
+is what finally lets the `phone_detected` and `second_person_detected`
+rules fire — they had been in the shipped policy since the beginning with
+nothing emitting `signal.object`, because the obvious detector (YOLO) is
+AGPL-3.0 and § 7 rules it out for network-deployed services.
+
+Stated rather than hidden: COCO-80 has `cell phone`, `person` and `book`
+but **no smartwatch and no headphones class**, so `wearable_detected`
+still cannot fire. The rule stays in the policy because deleting it would
+hide the gap from anyone reading the policy to see what is intended.
+
+`signal.frame_quality` (variance-of-Laplacian sharpness plus brightness)
+exists so that "we could not see" is distinguishable from "they did
+something". Every other visual signal degrades silently when the camera
+is bad: a blurred or dark frame lowers gaze confidence, loses iris
+landmarks and drops face detections, which — read without context — looks
+exactly like a candidate turning away. Its rule is `soft`, because an
+unusable camera is overwhelmingly a cheap webcam in a dim room rather
+than deliberate obstruction, and this code cannot tell those apart.
+
+### 5.7.4 Lockdown, and what it is not
+
+The shell blocks fullscreen exit, clipboard, developer tools, print,
+find, and right-click. This stops the accidental and the casual — the
+reflexive Cmd-C, the ESC that drops fullscreen mid-question. **It does
+not stop anyone determined.** A candidate can alt-tab at the OS level,
+use a second machine, or photograph the screen, and no amount of
+`preventDefault` in a renderer changes that. It is a guardrail plus an
+observation channel; the OS-level signals in the main process are what
+notice the serious cases.
+
+The three-warning allowance exists because ESC is muscle memory. Someone
+who hits one in the first minute of a stressful exam has not cheated, and
+a system that escalates on the first press generates flags a human then
+dismisses — which trains reviewers to dismiss flags generally. An
+exhausted allowance is a deliberate pattern, which is a far more
+reviewable claim.
+
+The count is local so the candidate can be warned instantly and
+accurately, but it is **not the authority**: `LockdownSignal.strike` is an
+observation like everything else, and the server counts the signals it
+received. A tampered client reporting `strike: 0` forever does not
+thereby have zero strikes.
+
+This is also the one place the fusion engine's onset guard had to be
+relaxed. `Rule` normally refuses a HARD rule with `onset_ms=0`, because a
+noisy detector firing on one frame becomes an accusation. A keystroke is
+not a detector sample — there is no "sustained Ctrl+C" to confirm, and
+requiring a window would make the rule fire on the second press or never
+— so `Rule.discrete` opts a rule out of that guard. It defaults to false,
+must be set per rule, and has tests pinning both the default and that
+ordinary detector rules are still rejected.
+
+### 5.7.5 Toasts are warnings, not verdicts
+
+The top-right notices are addressed to the candidate, not the proctor. A
+candidate who does not know they have been flagged cannot correct what
+caused it — moving a phone off the desk, turning on a light, sitting back
+in frame — and silent observation followed by a post-exam accusation is
+the failure mode this project exists to avoid. The wording is corrective
+("A phone is visible — please move it out of view"), never accusatory.
+
+They are driven by local detections, which makes them immediate but also
+means **a toast is not proof a flag was raised**: the server applies onset
+windows and confidence thresholds the renderer does not, so a brief
+phone-shaped blur can toast without ever becoming a violation. Warning
+early and sometimes unnecessarily is kinder than warning late and never,
+but it does mean a toast must never be phrased as though a decision has
+been made.
+
+## 5.8 Storage backends
+
+`SqliteStore` and `PostgresStore` implement the same `Store` protocol, and
+which one is in use is a connection-string decision no request handler can
+observe. SQLite stays the default because it is single-file, stdlib, and
+entirely adequate for one gateway process — the test suite and local
+development should not need a database container.
+
+Postgres exists for the point at which either of those stops being true:
+more than one gateway process (SQLite is single-writer), or an institution
+that wants the audit trail somewhere a person can query with ordinary
+tools.
+
+The SQL is written out twice rather than shared through a dialect
+abstraction. The two diverge in placeholders, upsert syntax,
+autoincrement, boolean handling and JSON decoding, and a shared layer
+would be mostly branches — a subtly wrong branch in the store that holds
+the audit trail is worse than duplication a reader can check line by line.
+
+`python/tests/test_store_backends.py` runs one parametrised suite against
+both, because a behaviour that holds in one and not the other is a bug
+that otherwise surfaces only in whichever environment is less tested. The
+Postgres runs skip when no DSN is configured, so a laptop without Docker
+still gets a green suite — they are not optional where it matters.
+
 ## 6. Human review
 
 Every rule shipped in this repo is `action: flag`, and a test enforces it.
@@ -751,13 +908,36 @@ single spurious phone detection, muttering while thinking, a bad webcam.
 ## 8. Status
 
 Built and tested: protocol, fusion engine, gateway, simulator, Electron
-client (including publishing to a LiveKit room, § 5.6.6), proctor console
+client (consent gate, edge inference, object and frame-quality detection,
+exam lockdown, LiveKit publishing — § 5.6.6, § 5.7), proctor console
 (including on-demand violation evidence and transcript rendering,
-§ 5.5.8), persistence, identity verification, audio pipeline, and the
-media plane — SFU tokens, webhook verification, recording lifecycle
-(§ 5.6) (250 Python + 29 TypeScript tests). The full chain has been run
-end-to-end against a synthetic camera feed in both the face-present and
-no-face cases; see `apps/client/scripts/e2e.mjs`.
+§ 5.5.8), persistence on SQLite *or* Postgres (§ 5.8), identity
+verification, audio pipeline, and the media plane (§ 5.6) — 279 Python
+(plus 19 Postgres-backed) + 56 TypeScript tests.
+
+The full chain has been run end-to-end against a synthetic camera feed in
+both the face-present and no-face cases (`apps/client/scripts/e2e.mjs`),
+and the media plane against the real docker-compose stack: consent → room
+join → publish → `room_started` webhook → egress → a playable MP4 on disk
+with its path recorded in Postgres.
+
+Four bugs surfaced only from that live run, none of which any amount of
+unit testing would have caught, and all of which are the argument for
+running the real thing:
+
+1. The Egress RPC was being POSTed to a `ws://` URL. Twirp is HTTP; the
+   server answered 404, which reads like a wrong path rather than a wrong
+   scheme.
+2. LiveKit sends its webhook JWT in `Authorization` (bare, no `Bearer`),
+   not the `Authorize` header this code had been written against — every
+   delivery was rejected 401 and no recording ever started.
+3. Egress webhooks carry no top-level `room` object; the room name is
+   inside `egressInfo.roomName`. Reading only `room.name` left every
+   egress event with an empty room name.
+4. `PROCTOR_LIVEKIT_URL` was serving two different network perspectives —
+   the gateway's own API calls and the address handed to clients. Inside
+   Docker these are necessarily different, so it is now split into
+   `livekit_url` and `livekit_public_url`.
 
 Two findings from live runs are worth recording, because they are the
 argument for doing this at all. The process blacklist matched the
@@ -787,8 +967,12 @@ worktree), so it predates and is unrelated to §5.6 — flagged rather than
 folded into that work, since fixing a send-ordering guarantee correctly
 deserves its own focused change, not a bolt-on to an unrelated feature.
 
-Not built: client-side microphone capture and VAD (§ 5.5.6), ID document
-capture (§ 5.4.3). The proctor stream is now token-authenticated and
+Not built: a browser-extension form factor — an extension can do camera
+inference, fullscreen, tab focus and keystroke capture, but cannot
+inspect OS processes or detect additional displays, so it would be a
+materially weaker product that should not be described as equivalent.
+Also not built: client-side microphone capture and VAD (§ 5.5.6), ID
+document capture (§ 5.4.3). The proctor stream is now token-authenticated and
 fails closed, but there is still no per-proctor identity, no audit of who
 looked at whom, and no TLS termination here — do not expose this gateway
 publicly without putting those in front of it.

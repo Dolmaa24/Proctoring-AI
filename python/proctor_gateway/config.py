@@ -156,17 +156,32 @@ class Settings:
     """
 
     livekit_url: str = ""
-    """Self-hosted LiveKit server URL (e.g. `wss://livekit.example.org`).
+    """Where the *gateway* reaches LiveKit (e.g. `ws://livekit:7880`).
 
     Empty selects `FakeRoomProvider` — no network call, no real server —
     the same "empty selects the test double" convention as
     `face_model_path` and `audio_model_path`. Unlike those, the reason is
-    neither licensing nor dependency weight: there is simply no LiveKit
-    server available in the environment this was built in to test
-    against. See `proctor_media.provider`'s module docstring for exactly
-    which parts of the integration rest on solid, long-documented ground
-    (tokens, webhooks) versus a best-effort against a more version-
-    sensitive one (the Egress recording RPC).
+    neither licensing nor dependency weight: it is that a LiveKit server
+    is a piece of infrastructure not everyone running this will have.
+
+    This is the *server-side* address, used for the Egress RPC. It is
+    frequently not the address a candidate's browser can reach — inside
+    Docker it is a compose service name that resolves nowhere else —
+    which is why `livekit_public_url` exists separately.
+    """
+
+    livekit_public_url: str = ""
+    """Where *candidates and proctors* reach LiveKit, if different.
+
+    Splitting this from `livekit_url` is not ceremony: one setting cannot
+    serve both perspectives. In the compose stack the gateway must call
+    `ws://livekit:7880` (a service name, resolvable only on the compose
+    network) while a browser on the host must be told `ws://localhost:7880`.
+    Handing the container-internal name to a client produces a connection
+    that hangs with no useful error.
+
+    Empty means "same as `livekit_url`", which is correct whenever the
+    server is reachable at one address from everywhere.
     """
 
     livekit_api_key: str = ""
@@ -241,6 +256,7 @@ class Settings:
             # llm_complete is intentionally absent here: it is code, not an
             # environment value. See its docstring.
             livekit_url=os.environ.get("PROCTOR_LIVEKIT_URL", ""),
+            livekit_public_url=os.environ.get("PROCTOR_LIVEKIT_PUBLIC_URL", ""),
             livekit_api_key=os.environ.get("PROCTOR_LIVEKIT_API_KEY", ""),
             livekit_api_secret=os.environ.get("PROCTOR_LIVEKIT_API_SECRET", ""),
             media_consent_notice=os.environ.get("PROCTOR_MEDIA_CONSENT_NOTICE", ""),
@@ -272,6 +288,11 @@ class Settings:
         surfaced to a human without an automated intent read on top.
         """
         return bool(self.audio_consent_notice.strip())
+
+    @property
+    def client_livekit_url(self) -> str:
+        """The address handed to candidates and proctors."""
+        return self.livekit_public_url or self.livekit_url
 
     @property
     def media_enabled(self) -> bool:

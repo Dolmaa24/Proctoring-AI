@@ -400,9 +400,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "    console: http://localhost:8000/console",
                 settings.console_token,
             )
+        # Discrete rules are excluded from the shortest-onset calculation.
+        # The check asks whether clock stretching could hide a violation
+        # inside the tolerance window, which only makes sense for a rule
+        # that requires a condition to *persist*. A discrete rule has an
+        # onset of 0 by nature (see Rule.discrete), and including it would
+        # peg the minimum at zero and make this warn on every start-up
+        # regardless of how the tolerance is actually tuned.
+        onsets = [r.onset_ms for r in policy.rules if not r.discrete]
         for warning in validate_against_policy(
             settings.clock_skew_tolerance_ms,
-            min((r.onset_ms for r in policy.rules), default=settings.clock_skew_tolerance_ms),
+            min(onsets, default=settings.clock_skew_tolerance_ms),
         ):
             log.warning("%s", warning)
         try:
@@ -754,47 +762,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown session")
         return {
             "enabled": settings.media_enabled,
-            "url": settings.livekit_url or None,
+            "url": settings.client_livekit_url or None,
         }
 
     @app.post("/v1/sessions/{session_id}/consent")
     async def record_consent(session_id: str) -> dict[str, Any]:
-        """The candidate accepted the disclaimer; start recording if enabled.
+        """The candidate accepted the disclaimer.
 
-        Recording starts here, server-side, rather than from the client
-        that just consented. The candidate's client has no console token
-        and cannot call the proctor recording endpoints — that boundary
-        stays intact (see `start_recording`). What it can do is report the
-        one fact it witnessed, and the server decides what follows.
+        Recording is deliberately *not* started here. At the moment
+        consent is given the candidate has not joined the media room yet —
+        the client shows the dialog before it opens the camera, which is
+        the whole point of a consent gate — so there is no room to record
+        and LiveKit answers `requested room does not exist`. The recording
+        is started instead when the room actually starts, from the
+        `room_started` webhook (see `_start_recording_for_room`), which
+        also means a candidate who drops and reconnects gets a recording
+        without anything having to retry.
 
-        Failing to start a recording does not fail the consent: the
-        candidate has agreed and the exam should proceed, with the
-        recording gap visible to a reviewer rather than a modal the
-        candidate cannot get past. The returned `recording` field says
-        plainly which happened.
+        The lifecycle event on the signed telemetry stream, emitted by the
+        client's main process, is the authoritative record that consent
+        was given; this endpoint exists so the server learns about it
+        without having to parse the telemetry stream for control flow.
         """
         if registry.get(session_id) is None:
             raise HTTPException(status_code=404, detail="unknown session")
-
-        if not settings.media_enabled:
-            return {"consent": "recorded", "recording": None}
-
-        now = settings.clock()
-        try:
-            started = await asyncio.to_thread(media_provider.start_recording, session_id)
-        except RoomProviderError as exc:
-            log.warning("consent recorded for %s but recording failed: %s", session_id, exc)
-            return {"consent": "recorded", "recording": None, "error": str(exc)}
-
-        record = RecordingRecord(
-            recording_id=str(uuid.uuid4()),
-            session_id=session_id,
-            status=RecordingStatus.REQUESTED,
-            requested_ms=now,
-            egress_id=started.egress_id,
-        )
-        store.save_recording(record.as_dict(), now)
-        return {"consent": "recorded", "recording": record.as_dict()}
+        log.info("consent recorded for %s", session_id)
+        return {
+            "consent": "recorded",
+            "recording": "starts when the media room opens" if settings.media_enabled else None,
+        }
 
     @app.post("/v1/sessions/{session_id}/media/token")
     async def candidate_media_token(session_id: str) -> dict[str, Any]:
@@ -820,7 +816,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=503, detail="media disabled: no consent notice configured"
             )
         token = media_provider.candidate_token(session_id, identity="candidate")
-        return {"url": settings.livekit_url, "token": token}
+        return {"url": settings.client_livekit_url, "token": token}
 
     @app.post("/v1/proctor/sessions/{session_id}/media/token")
     async def proctor_media_token(
@@ -846,7 +842,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # noted for the console generally (nothing here newly introduces
         # it; it is worth closing before this is relied on for real review).
         token = media_provider.proctor_token(session_id, identity="proctor")
-        return {"url": settings.livekit_url, "token": token}
+        return {"url": settings.client_livekit_url, "token": token}
 
     @app.post("/v1/proctor/sessions/{session_id}/media/recording/start", status_code=201)
     async def start_recording(
@@ -925,13 +921,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             event = verify_webhook(
                 body,
-                request.headers.get("Authorize"),
+                # LiveKit 1.x sends the raw JWT in `Authorization`, with no
+                # `Bearer ` prefix. `Authorize` is checked as a fallback
+                # because older releases used that name, and a webhook
+                # rejected over a header spelling is a silent
+                # no-recordings failure that looks like nothing at all.
+                request.headers.get("Authorization") or request.headers.get("Authorize"),
                 LiveKitCredentials(settings.livekit_api_key, settings.livekit_api_secret),
             )
         except TokenError as exc:
+            # Logged, not only returned. The 401 goes back to LiveKit,
+            # which does not read it; an operator whose recordings are
+            # silently never starting needs to see the reason on this
+            # side, and "key mismatch" vs "body hash mismatch" are very
+            # different problems to go looking for.
+            log.warning("rejected media webhook: %s", exc)
             raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-        _apply_webhook_event(store, event, settings.clock())
+        if event.event == "room_started":
+            await _start_recording_for_room(
+                store, media_provider, settings, event.room_name, settings.clock()
+            )
+        else:
+            _apply_webhook_event(store, event, settings.clock())
         return {"status": "ok"}
 
     @app.get("/v1/proctor/sessions")
@@ -1181,6 +1193,66 @@ def _recording_from_dict(stored: dict[str, Any]) -> RecordingRecord:
     )
 
 
+def _session_id_from_room(room_name: str | None) -> str | None:
+    """Rooms are named `proctor-{session_id}` — see `provider._room_name`."""
+    if not room_name or not room_name.startswith("proctor-"):
+        return None
+    return room_name[len("proctor-") :]
+
+
+async def _start_recording_for_room(
+    store: Any, provider: Any, settings: Settings, room_name: str | None, now_ms: int
+) -> None:
+    """Start a recording when the candidate's room actually opens.
+
+    This is where recording begins, rather than at consent: the client
+    shows its disclaimer before opening the camera, so at consent time
+    there is no room and LiveKit rejects the egress request outright.
+
+    Idempotent by session, because `room_started` can be delivered more
+    than once — LiveKit retries, and a candidate who reconnects opens the
+    room again. Starting a second egress for a session that already has a
+    live one would produce two files and two rows for one exam.
+    """
+    session_id = _session_id_from_room(room_name)
+    if session_id is None or not settings.media_enabled:
+        return
+
+    live = {RecordingStatus.REQUESTED, RecordingStatus.ACTIVE, RecordingStatus.STOPPING}
+    for existing in store.load_recordings_for_session(session_id):
+        if RecordingStatus(existing["status"]) in live:
+            return
+
+    try:
+        started = await asyncio.to_thread(provider.start_recording, session_id)
+    except RoomProviderError as exc:
+        # Logged, not raised. A 500 here makes LiveKit retry the same
+        # delivery, and a recording that could not start is a gap for a
+        # reviewer to see rather than a reason to break the webhook.
+        log.warning("could not start recording for %s: %s", session_id, exc)
+        return
+
+    # The `egress_started` webhook routinely arrives before this function
+    # gets back from the RPC and writes its row — LiveKit is fast and the
+    # two are racing. If the webhook won, it has already created the row
+    # (see `_apply_webhook_event`) at a *later* status, and overwriting it
+    # with REQUESTED here would walk the lifecycle backwards.
+    if store.find_recording_by_egress_id(started.egress_id) is not None:
+        return
+
+    store.save_recording(
+        RecordingRecord(
+            recording_id=started.egress_id,
+            session_id=session_id,
+            status=RecordingStatus.REQUESTED,
+            requested_ms=now_ms,
+            egress_id=started.egress_id,
+        ).as_dict(),
+        now_ms,
+    )
+    log.info("recording %s started for %s", started.egress_id, session_id)
+
+
 def _apply_webhook_event(store: Any, event: Any, now_ms: int) -> None:
     """Update a recording's stored status from a LiveKit webhook.
 
@@ -1195,12 +1267,29 @@ def _apply_webhook_event(store: Any, event: Any, now_ms: int) -> None:
 
     with_session = store.find_recording_by_egress_id(event.egress_id)
     if with_session is None:
-        log.warning(
-            "webhook for unknown egress_id %s (event=%s); ignoring",
-            event.egress_id,
-            event.event,
-        )
-        return
+        session_id = _session_id_from_room(event.room_name)
+        if session_id is None:
+            log.warning(
+                "webhook for unknown egress_id %s (event=%s, room=%s); ignoring",
+                event.egress_id,
+                event.event,
+                event.room_name,
+            )
+            return
+        # The other half of the race in `_start_recording_for_room`: this
+        # webhook beat our own RPC call's write. The row is created here
+        # instead, keyed on the egress id so that whichever side lands
+        # first wins and the other finds it rather than duplicating it.
+        # This also covers a gateway restart mid-recording, where the
+        # in-flight egress is otherwise never accounted for.
+        with_session = RecordingRecord(
+            recording_id=event.egress_id,
+            session_id=session_id,
+            status=RecordingStatus.REQUESTED,
+            requested_ms=now_ms,
+            egress_id=event.egress_id,
+        ).as_dict()
+        store.save_recording(with_session, now_ms)
 
     record = _recording_from_dict(with_session)
     target = _STATUS_FOR_EVENT.get(event.event)

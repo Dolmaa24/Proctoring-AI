@@ -6,15 +6,24 @@
          relaxing script-src to 'unsafe-inline'. Recompute the hash if the
          map changes; scripts/build.mjs verifies it.
 
-         connect-src is widened to wss:/https: for the LiveKit room
-         connection: the operator's LiveKit URL is a runtime deployment
-         value (fetched from the gateway after enrolment), not a build-time
-         constant, so it cannot be pinned to a specific origin the way
-         script-src is pinned to an exact hash above. This is a real, if
-         narrow, loosening — only network destinations are broadened, not
-         script execution — see ARCHITECTURE.md § 5.6. -->
+         connect-src is widened for the LiveKit room connection: the
+         operator's LiveKit URL is a runtime deployment value (fetched
+         from the gateway after enrolment), not a build-time constant, so
+         it cannot be pinned to a specific origin the way script-src is
+         pinned to an exact hash above. Only network destinations are
+         broadened, not script execution — see ARCHITECTURE.md § 5.6.
+
+         Remote connections are restricted to wss:/https:, so a candidate's
+         video can never be carried to another host in plaintext. Plaintext
+         ws:/http: is permitted *only to loopback*, where there is no
+         network to intercept — that is what makes a local docker-compose
+         LiveKit usable without either weakening the rule for real
+         deployments or maintaining a separate development build.
+
+         Note LiveKit also issues an http(s) `/rtc/v1/validate` request
+         alongside the WebSocket, so both schemes are needed per host. -->
     <meta http-equiv="Content-Security-Policy"
-          content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-QH+Ho+Y3uV24gUTEbXvIZo+3D26ARzWCb8fPImM1Ox0='; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: https:" />
+          content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-QH+Ho+Y3uV24gUTEbXvIZo+3D26ARzWCb8fPImM1Ox0='; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: https: ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*" />
     <title>Exam session</title>
     <style>
       :root { color-scheme: light dark; font-family: system-ui, sans-serif; }

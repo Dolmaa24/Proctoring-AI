@@ -855,8 +855,21 @@ class SqliteStore:
 
 
 def open_store(path: str) -> Store:
-    """`:memory:` selects the no-op store; anything else is a SQLite file."""
+    """Select a backend from the connection string.
+
+    - `:memory:`                 -> `MemoryStore`, no persistence at all
+    - `postgres://` / `postgresql://` -> `PostgresStore`
+    - anything else              -> `SqliteStore` at that file path
+
+    Postgres is imported lazily so that the ordinary SQLite and in-memory
+    paths — which are what the test suite and local development use — do
+    not require the driver to be installed or a database to be reachable.
+    """
     if path == ":memory:":
         return MemoryStore()
+    if path.startswith(("postgres://", "postgresql://")):
+        from .postgres_store import connect
+
+        return connect(path)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     return SqliteStore(path)

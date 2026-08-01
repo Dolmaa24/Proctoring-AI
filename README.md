@@ -32,11 +32,93 @@ Start the gateway:
 PROCTOR_MASTER_SECRET=dev-secret PROCTOR_CONSOLE_TOKEN=dev-token .venv/bin/uvicorn proctor_gateway.app:app --reload
 ```
 
-The proctor console is then at <http://localhost:8000/console>. It asks
-for the token above; leave `PROCTOR_CONSOLE_TOKEN` unset and the gateway
-generates one and logs it at startup. The proctor endpoints **fail
-closed** — there is no unauthenticated mode, because they carry every
-candidate's flags.
+The proctor console is then at <http://localhost:8000/console>.
+
+### Getting the console token
+
+The console asks for a token before it will show you anything. The proctor
+endpoints **fail closed** — there is no unauthenticated mode, because they
+carry every candidate's flags and evidence. You do not have to create the
+token anywhere; there are two ways to get one.
+
+**Set it yourself.** Whatever you put in `PROCTOR_CONSOLE_TOKEN` *is* the
+token — it is a shared secret you choose, not something registered with a
+service:
+
+```bash
+PROCTOR_MASTER_SECRET=dev-secret PROCTOR_CONSOLE_TOKEN=dev-token .venv/bin/uvicorn proctor_gateway.app:app --reload
+```
+
+Then type `dev-token` into the console prompt.
+
+**Or let the gateway generate one.** Leave `PROCTOR_CONSOLE_TOKEN` unset
+and it makes a random one for that run and prints it at startup:
+
+```
+WARNING  PROCTOR_CONSOLE_TOKEN is unset; generated a token for this run only:
+             kJ3n8-QpX7vT2mR9wLzY4dFhB6sN1cVe
+             console: http://localhost:8000/console
+```
+
+Copy that value into the prompt. It changes on every restart, so set it
+explicitly for anything you come back to.
+
+Under Docker the same warning goes to the container log:
+
+```bash
+docker compose logs gateway | grep -A2 "PROCTOR_CONSOLE_TOKEN is unset"
+```
+
+Two things worth knowing: the token is stored in your browser's local
+storage once entered, so you are not retyping it every refresh; and it
+grants access to every candidate's flags, so treat it like any other
+credential rather than something to paste into a shared document.
+
+### Running the whole stack in Docker
+
+Postgres, a database browser, a real self-hosted LiveKit + egress (so
+recording actually works), and the gateway:
+
+```bash
+cp .env.example .env
+```
+
+Fill in the four required secrets — the file says which and how to
+generate them — then:
+
+```bash
+docker compose up -d
+```
+
+| | | |
+|---|---|---|
+| Gateway + console | <http://localhost:8000/console> | token from `.env` |
+| Adminer (browse the database) | <http://localhost:8080> | server `postgres`, user/password from `.env` |
+| LiveKit | `ws://localhost:7880` | |
+| Recordings | `./data/recordings/` | MP4 per session, plus a JSON sidecar |
+
+**Reading sessions by hand.** Adminer is the point-and-click route.
+Everything is equally reachable with `psql`, since Postgres is published
+on a host port:
+
+```bash
+docker compose exec postgres psql -U proctor -d proctor -c "SELECT session_id, exam_id, events_received FROM sessions;"
+```
+
+The tables worth knowing: `sessions` (one row per exam sitting, including
+the replay-protection counters), `violations` (the audit trail, with
+evidence as JSONB), `recordings` (a *reference* to each video — never the
+video itself), and `identity_templates` / `audio_transcripts`, which are
+on deliberately shorter retention clocks than the rest.
+
+**Recording lifecycle.** A recording is not started when the candidate
+consents — at that moment they have not joined the media room yet, so
+there is nothing to record. The gateway starts it from LiveKit's
+`room_started` webhook and follows it through `requested → active →
+available`, writing the file path into `recordings.storage_ref` when
+egress reports the file is written. Purging a row removes that reference;
+the MP4 under `./data/recordings/` is yours to manage, and no retention
+setting in this project deletes it.
 
 Drive a simulated candidate against it:
 
@@ -64,17 +146,42 @@ Drive a simulated candidate against it:
 | `proctor_fusion` | Temporal filtering, declarative policy, no I/O |
 | `proctor_gateway` | FastAPI ingest, integrity checks, proctor fan-out |
 | `proctor_sim` | Scripted candidates + six client-tampering modes |
-| `policies/default.yaml` | 16 rules, all flag-only |
-| `apps/client` | Electron client: MediaPipe inference, signed transport, OS observation, LiveKit publish |
+| `policies/default.yaml` | 18 rules, all flag-only |
+| `apps/client` | Electron client: consent gate, MediaPipe inference, object/quality detection, exam lockdown, signed transport, OS observation, LiveKit publish |
 | `apps/console` | Proctor console: triage queue, per-session audit timeline |
-| `proctor_gateway.store` | SQLite persistence + retention |
+| `proctor_gateway.store` | SQLite **or** Postgres persistence + retention |
 | `proctor_identity` | Enrolment, face matching, temporal decision |
 | `proctor_audio` | Transcription, intent classification, temporal escalation |
 | `proctor_media` | LiveKit tokens, webhook verification, recording lifecycle |
 
 The full chain has been run end-to-end — camera → MediaPipe → IPC → signed
 WebSocket → gateway → fusion → proctor stream — against a synthetic camera
-feed, in both the face-present and no-face cases.
+feed, in both the face-present and no-face cases. The media plane has been
+run against the real compose stack too: consent → room join → publish →
+`room_started` webhook → egress → a playable MP4 on disk with its path
+recorded in Postgres.
+
+### What the candidate sees
+
+The session opens with a **disclaimer that names everything captured** —
+camera, microphone, recording and its retention window, process and
+display checks, and the lockdown rules. Nothing starts until they accept:
+the camera is not opened and no model is loaded before that, because a
+disclaimer shown while the webcam light is already on is notification
+rather than consent.
+
+On accept the window goes fullscreen and monitoring begins. Detections
+raise a **notice in the top-right corner** — "A phone is visible", "More
+than one face is visible", "Your camera looks blurred" — worded to let the
+candidate fix the problem rather than to accuse them. A toast is not proof
+a flag was raised: the server applies confirmation windows the client does
+not.
+
+Leaving fullscreen, copy/paste, developer tools and right-click are
+blocked, with **three warnings** and a visible count before further
+attempts are recorded for review. ESC and Cmd-C are muscle memory, and a
+system that escalates on the first press produces flags reviewers learn to
+dismiss.
 
 State survives a restart — sessions, the triage board, and the audit
 trail. Sequence state in particular *must* survive: without it a restart
@@ -168,11 +275,19 @@ cd apps/client && npm install && npm run vendor
 ```
 
 `npm run vendor` copies the MediaPipe WASM and the `livekit-client` SDK
-out of `node_modules`, and downloads the face landmarker model (3.8 MB,
-from Google's official host), recording SHA-256 digests in
+out of `node_modules`, and downloads two models from Google's official
+host — the face landmarker (3.8 MB) and EfficientDet-Lite0 (13.8 MB, for
+phone/person/book detection) — recording SHA-256 digests in
 `models/manifest.json`. The assets are bundled rather than fetched at
 exam time: the client must work on a locked-down network, and a model
 downloaded during an exam is a model nobody has attested.
+
+The object detector is EfficientDet-Lite specifically because it is
+Apache-2.0. **Do not swap in Ultralytics YOLO** — it is AGPL-3.0 and that
+reaches network-deployed services. One honest gap: COCO-80 has no
+smartwatch or headphones class, so the `wearable_detected` rule in the
+policy cannot fire from this model. The rule is left in place rather than
+deleted so the gap is visible instead of silently absent.
 
 End-to-end, with no webcam and no volunteer:
 
@@ -213,7 +328,17 @@ detection, muttering while thinking, a bad webcam.
 make test
 ```
 
-Python (250) and TypeScript (29). The suite has three parts, and the last
+Python (279, plus 19 that need Postgres — see below) and TypeScript (56).
+The store tests run the same assertions against both SQLite and Postgres,
+since a behaviour that holds in one and not the other is a bug that
+otherwise only surfaces in whichever environment is less tested:
+
+```bash
+PROCTOR_TEST_POSTGRES_DSN=postgresql://proctor:PASSWORD@localhost:5433/proctor .venv/bin/python -m pytest python/tests/test_store_backends.py -q
+```
+
+They skip cleanly when that variable is unset, so a laptop without Docker
+still gets a green suite. The rest of the suite has three parts, and the last
 two are the interesting ones:
 
 - **Behavioural** — does policy do the right thing for honest and dishonest
