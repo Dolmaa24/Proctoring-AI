@@ -33,21 +33,46 @@ OUTPUT = (
     / "events.generated.ts"
 )
 
-PAYLOAD_MODELS = [
-    events.GazeSignal,
-    events.HeadPoseSignal,
-    events.FaceSignal,
-    events.ObjectSignal,
-    events.LivenessSignal,
-    events.AudioSignal,
-    events.EnvironmentSignal,
-    events.Heartbeat,
-    events.Lifecycle,
-    events.Attestation,
-]
+def _payload_models() -> list[type[BaseModel]]:
+    """The members of `Payload`, read from the annotation itself.
+
+    Derived rather than listed by hand. A hand-maintained list drifts the
+    moment someone adds a payload type: the `Envelope` interface below is
+    generated from the real annotation, so a missing entry here emitted a
+    union referencing an interface that was never written — TypeScript
+    that does not compile, from a generator whose whole job is stopping
+    the two halves of the protocol from disagreeing.
+    """
+    annotation = events.Payload
+    # Annotated[X | Y, Field(...)] -> unwrap to the union, then to members.
+    if typing.get_origin(annotation) is typing.Annotated:
+        annotation = typing.get_args(annotation)[0]
+    return list(typing.get_args(annotation))
+
+
+def _enums_used_by(models: list[type[BaseModel]]) -> list[type[enum.Enum]]:
+    """Every enum reachable from a field, in first-seen order.
+
+    Same reasoning as `_payload_models`: `ts_type` emits an enum by name,
+    so an enum that is used but never declared is a dangling reference.
+    """
+    found: list[type[enum.Enum]] = []
+    for model in models:
+        for field in model.model_fields.values():
+            for candidate in (field.annotation, *typing.get_args(field.annotation)):
+                if (
+                    isinstance(candidate, type)
+                    and issubclass(candidate, enum.Enum)
+                    and candidate not in found
+                ):
+                    found.append(candidate)
+    return found
+
+
+PAYLOAD_MODELS = _payload_models()
 
 SUPPORT_MODELS = [events.BoundingBox]
-ENUMS = [events.ObjectLabel, events.LifecyclePhase]
+ENUMS = _enums_used_by([*SUPPORT_MODELS, *PAYLOAD_MODELS, events.Envelope])
 
 
 def ts_type(annotation: object) -> str:

@@ -166,6 +166,30 @@ async function startSession(): Promise<void> {
 
   ipcMain.handle("proctor:media-join", () => mediaJoin);
 
+  // Consent is the gate everything else waits behind, so it is main that
+  // records it: the lifecycle event goes on the signed telemetry stream
+  // (where it is ordered and tamper-evident alongside every observation),
+  // and the gateway is told separately so it can start the recording
+  // server-side. The candidate's client deliberately cannot start or stop
+  // a recording itself — that endpoint stays proctor-only.
+  ipcMain.handle("proctor:consent", async () => {
+    if (!telemetry) return false;
+    await telemetry.emit({ type: "lifecycle", phase: "exam_start", detail: "consent granted" });
+    try {
+      const response = await fetch(
+        `${GATEWAY_URL}/v1/sessions/${enrolment.session_id}/consent`,
+        { method: "POST" },
+      );
+      return response.ok;
+    } catch (error) {
+      // A failed consent POST must not strand the candidate at a modal.
+      // The lifecycle event above already went out on the signed stream,
+      // which is the record that matters for review.
+      console.error("could not record consent with the gateway:", error);
+      return false;
+    }
+  });
+
   setInterval(async () => {
     if (!telemetry) return;
     const { signal } = await readEnvironment(window);

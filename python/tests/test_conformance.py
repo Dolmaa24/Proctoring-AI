@@ -63,7 +63,7 @@ def ts_frames() -> dict:
 def test_typescript_signed_frames_verify_in_python(ts_frames):
     """Every payload type, signed by the client code, accepted by the server."""
     key = derive_session_key(MASTER, ts_frames["session_id"])
-    assert len(ts_frames["frames"]) == 10, "expected one frame per payload type"
+    assert len(ts_frames["frames"]) == 12, "expected one frame per payload type"
 
     seen: set[str] = set()
     for index, frame in enumerate(ts_frames["frames"]):
@@ -80,6 +80,8 @@ def test_typescript_signed_frames_verify_in_python(ts_frames):
         "signal.liveness",
         "signal.audio",
         "signal.environment",
+        "signal.frame_quality",
+        "signal.lockdown",
         "heartbeat",
         "lifecycle",
         "attestation",
@@ -105,11 +107,16 @@ def test_awkward_floats_survive_the_round_trip(ts_frames):
 def test_non_ascii_payloads_survive_the_round_trip(ts_frames):
     """UTF-8 handling must agree; a mismatch here breaks real process names."""
     key = derive_session_key(MASTER, ts_frames["session_id"])
-    environment = verify_frame(ts_frames["frames"][6], key).payload
-    assert "Ünïcodé-Prøcess" in environment.blacklisted_processes
-
-    lifecycle = verify_frame(ts_frames["frames"][8], key).payload
-    assert lifecycle.detail == "candidate finished — done"
+    # Looked up by type rather than by frame index: the harness grows a
+    # frame every time a payload type is added, and positional lookups
+    # silently start asserting against the wrong payload when it does.
+    by_type = {
+        verify_frame(frame, key).payload.type: verify_frame(frame, key).payload
+        for frame in ts_frames["frames"]
+    }
+    assert "Ünïcodé-Prøcess" in by_type["signal.environment"].blacklisted_processes
+    assert by_type["lifecycle"].detail == "candidate finished — done"
+    assert by_type["signal.lockdown"].detail == "Meta+C — copy"
 
 
 def test_tampering_with_a_typescript_frame_is_rejected(ts_frames):

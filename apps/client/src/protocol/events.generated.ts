@@ -9,6 +9,7 @@
 export const PROTOCOL_VERSION = 1;
 
 export type ObjectLabel = "phone" | "person" | "smartwatch" | "headphones" | "book";
+export type LockdownEvent = "fullscreen_exit" | "restricted_key" | "clipboard" | "context_menu" | "tab_switch";
 export type LifecyclePhase = "session_start" | "identity_verified" | "exam_start" | "exam_end" | "session_end";
 
 export interface BoundingBox {
@@ -70,6 +71,23 @@ export interface EnvironmentSignal {
   confidence?: number;
 }
 
+export interface FrameQualitySignal {
+  type: "signal.frame_quality";
+  sharpness: number;
+  brightness: number;
+  face_covered?: boolean;
+  confidence?: number;
+}
+
+export interface LockdownSignal {
+  type: "signal.lockdown";
+  event: LockdownEvent;
+  strike: number;
+  allowance: number;
+  detail?: string | null;
+  confidence?: number;
+}
+
 export interface Heartbeat {
   type: "heartbeat";
   frames_processed: number;
@@ -98,6 +116,8 @@ export type Payload =
   | LivenessSignal
   | AudioSignal
   | EnvironmentSignal
+  | FrameQualitySignal
+  | LockdownSignal
   | Heartbeat
   | Lifecycle
   | Attestation;
@@ -108,5 +128,5 @@ export interface Envelope {
   seq: number;
   ts_client_ms: number;
   ts_monotonic_ms: number;
-  payload: GazeSignal | HeadPoseSignal | FaceSignal | ObjectSignal | LivenessSignal | AudioSignal | EnvironmentSignal | Heartbeat | Lifecycle | Attestation;
+  payload: GazeSignal | HeadPoseSignal | FaceSignal | ObjectSignal | LivenessSignal | AudioSignal | EnvironmentSignal | FrameQualitySignal | LockdownSignal | Heartbeat | Lifecycle | Attestation;
 }

@@ -15,8 +15,11 @@ from proctor_protocol import (
     Envelope,
     EnvironmentSignal,
     FaceSignal,
+    FrameQualitySignal,
     GazeSignal,
     Heartbeat,
+    LockdownEvent,
+    LockdownSignal,
     ObjectLabel,
     ObjectSignal,
 )
@@ -277,6 +280,68 @@ def test_default_policy_loads_and_is_flag_only():
     assert all(r.requires_human_review or r.severity is Severity.INFO for r in policy.rules)
 
 
+def lockdown(strike: int, event: LockdownEvent = LockdownEvent.FULLSCREEN_EXIT) -> LockdownSignal:
+    return LockdownSignal(event=event, strike=strike, allowance=3, confidence=1.0)
+
+
+def test_strikes_within_the_allowance_raise_nothing(engine):
+    """The whole point of an allowance.
+
+    A candidate who hits Escape once in a stressful exam has not cheated,
+    and a system that flags them trains reviewers to dismiss flags.
+    """
+    fired = []
+    for strike in (1, 2, 3):
+        fired += feed(engine, lockdown(strike), strike * 1000)
+    assert fired == []
+
+
+def test_exceeding_the_allowance_flags_for_review(engine):
+    fired = []
+    for strike in (1, 2, 3, 4):
+        fired += feed(engine, lockdown(strike), strike * 1000)
+    assert len(fired) == 1
+    assert fired[0].rule_id == "lockdown_strikes_exhausted"
+    assert fired[0].severity is Severity.HARD
+    assert fired[0].requires_human_review is True
+
+
+def test_the_lockdown_flag_never_ends_the_exam_itself(engine):
+    """Consistent with every other rule shipped here — see § 6."""
+    fired = []
+    for strike in range(1, 8):
+        fired += feed(engine, lockdown(strike), strike * 1000)
+    assert all(v.action is AutomatedAction.FLAG for v in fired)
+
+
+def test_a_briefly_blurred_frame_is_not_flagged(engine):
+    """A hand passing the lens, or a moment of refocus. Extremely common,
+    and not evidence of anything."""
+    fired = []
+    for t in range(0, 2000, 200):
+        fired += feed(engine, FrameQualitySignal(sharpness=0.01, brightness=0.5), t)
+    assert fired == []
+
+
+def test_a_sustained_unusable_camera_is_reported_softly(engine):
+    """Soft, not hard: an unusable camera is overwhelmingly equipment, and
+    the value is telling a reviewer 'we could not see' rather than letting
+    the degraded signals read as evasion."""
+    fired = []
+    for t in range(0, 9000, 200):
+        fired += feed(engine, FrameQualitySignal(sharpness=0.01, brightness=0.5), t)
+    assert len(fired) == 1
+    assert fired[0].rule_id == "camera_unusable"
+    assert fired[0].severity is Severity.SOFT
+
+
+def test_an_ordinary_webcam_frame_is_never_flagged_as_unusable(engine):
+    fired = []
+    for t in range(0, 15000, 200):
+        fired += feed(engine, FrameQualitySignal(sharpness=0.4, brightness=0.55), t)
+    assert fired == []
+
+
 def test_hard_rule_with_zero_onset_is_rejected():
     """Guards against someone 'tightening' policy into a false-positive cannon."""
     with pytest.raises(ValueError, match="single frame"):
@@ -288,6 +353,46 @@ def test_hard_rule_with_zero_onset_is_rejected():
             severity=Severity.HARD,
             onset_ms=0,
         )
+
+
+def test_the_discrete_escape_hatch_does_not_weaken_the_guard_by_default():
+    """`discrete` must be opt-in per rule, never the default.
+
+    The onset guard is the main thing standing between a noisy detector
+    and an accusation. If adding the escape hatch had made it default-on,
+    every existing rule would have silently lost that protection.
+    """
+    assert Rule.model_fields["discrete"].default is False
+    with pytest.raises(ValueError, match="single frame"):
+        Rule(
+            id="still-guarded",
+            description="an ordinary detector rule",
+            signal="signal.object",
+            when=Condition(field="label", op="==", value="phone"),
+            severity=Severity.HARD,
+            onset_ms=0,
+            discrete=False,
+        )
+
+
+def test_a_discrete_signal_may_fire_instantly():
+    """A keystroke either happened or it did not.
+
+    There is no "sustained Ctrl+C" to confirm, so requiring an onset window
+    would mean this rule fires on the second press or never. This is the
+    one case the guard is not protecting against.
+    """
+    rule = Rule(
+        id="lockdown",
+        description="a discrete shell event",
+        signal="signal.lockdown",
+        when=Condition(field="strike", op=">", value=3),
+        severity=Severity.HARD,
+        onset_ms=0,
+        discrete=True,
+    )
+    assert rule.onset_ms == 0
+    assert rule.severity is Severity.HARD
 
 
 def test_lock_exam_without_human_review_is_rejected():

@@ -41,12 +41,33 @@ const livekitSource = path.join(
   "livekit-client.esm.mjs",
 );
 
-const MODEL = {
-  name: "face_landmarker.task",
-  // Float16 face landmarker with iris refinement — the iris points are what
-  // make gaze estimation possible at all; the 468-point model has none.
-  url: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-};
+const MODELS = [
+  {
+    name: "face_landmarker.task",
+    // Float16 face landmarker with iris refinement — the iris points are what
+    // make gaze estimation possible at all; the 468-point model has none.
+    url: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+  },
+  {
+    name: "efficientdet_lite0.tflite",
+    // Object detection, for the phone/second-person/book rules in
+    // policies/default.yaml. EfficientDet-Lite0 is Apache-2.0 and trained
+    // on COCO-80.
+    //
+    // This is specifically why the detector is this model and not YOLO:
+    // Ultralytics YOLO is AGPL-3.0, which reaches network-deployed
+    // services, and ARCHITECTURE.md § 7 rules it out for exactly that
+    // reason. EfficientDet-Lite is the permissively-licensed detector
+    // that makes object rules shippable at all.
+    //
+    // Known coverage gap, stated rather than papered over: COCO-80 has
+    // `cell phone`, `person` and `book`, but no smartwatch and no
+    // headphones class. The `wearable_detected` policy rule therefore
+    // cannot fire from this model — it needs a detector trained on those
+    // classes. See objects.ts.
+    url: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite",
+  },
+];
 
 const MANIFEST = path.join(vendorRoot, "manifest.json");
 
@@ -75,14 +96,14 @@ async function vendorLiveKit() {
   await copyFile(livekitSource, path.join(vendorRoot, "livekit-client.mjs"));
 }
 
-async function vendorModel() {
-  const target = path.join(vendorRoot, MODEL.name);
+async function vendorModel(model) {
+  const target = path.join(vendorRoot, model.name);
   if (existsSync(target)) {
-    console.log(`  ${MODEL.name} already present, skipping download`);
+    console.log(`  ${model.name} already present, skipping download`);
     return target;
   }
-  console.log(`  downloading ${MODEL.name} from ${new URL(MODEL.url).host}`);
-  const response = await fetch(MODEL.url);
+  console.log(`  downloading ${model.name} from ${new URL(model.url).host}`);
+  const response = await fetch(model.url);
   if (!response.ok) {
     throw new Error(`model download failed: ${response.status} ${response.statusText}`);
   }
@@ -93,26 +114,31 @@ async function vendorModel() {
 }
 
 async function writeManifest() {
-  const model = path.join(vendorRoot, MODEL.name);
+  const assets = {};
+  for (const model of MODELS) {
+    assets[model.name] = {
+      source: model.url,
+      digest: await sha256(path.join(vendorRoot, model.name)),
+    };
+  }
+  assets["vision_bundle.mjs"] = {
+    source: "@mediapipe/tasks-vision (npm)",
+    digest: await sha256(path.join(vendorRoot, "vision_bundle.mjs")),
+  };
+  assets["wasm/vision_wasm_internal.wasm"] = {
+    source: "@mediapipe/tasks-vision (npm)",
+    digest: await sha256(path.join(vendorRoot, "wasm", "vision_wasm_internal.wasm")),
+  };
+  assets["livekit-client.mjs"] = {
+    source: "livekit-client (npm)",
+    digest: await sha256(path.join(vendorRoot, "livekit-client.mjs")),
+  };
+
   const manifest = {
     generated: new Date().toISOString(),
     // Recorded so the client can attest what it is running, and so a
     // swapped model file is detectable rather than silent.
-    assets: {
-      [MODEL.name]: { source: MODEL.url, digest: await sha256(model) },
-      "vision_bundle.mjs": {
-        source: "@mediapipe/tasks-vision (npm)",
-        digest: await sha256(path.join(vendorRoot, "vision_bundle.mjs")),
-      },
-      "wasm/vision_wasm_internal.wasm": {
-        source: "@mediapipe/tasks-vision (npm)",
-        digest: await sha256(path.join(vendorRoot, "wasm", "vision_wasm_internal.wasm")),
-      },
-      "livekit-client.mjs": {
-        source: "livekit-client (npm)",
-        digest: await sha256(path.join(vendorRoot, "livekit-client.mjs")),
-      },
-    },
+    assets,
   };
   await writeFile(MANIFEST, JSON.stringify(manifest, null, 2) + "\n");
   return manifest;
@@ -140,7 +166,9 @@ await mkdir(vendorRoot, { recursive: true });
 console.log("vendoring MediaPipe assets:");
 const copied = await vendorWasm();
 console.log(`  copied ${copied} runtime files from node_modules`);
-await vendorModel();
+for (const model of MODELS) {
+  await vendorModel(model);
+}
 console.log("vendoring livekit-client:");
 await vendorLiveKit();
 const manifest = await writeManifest();

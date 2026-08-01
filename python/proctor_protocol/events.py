@@ -137,6 +137,58 @@ class EnvironmentSignal(_Frozen):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
+class FrameQualitySignal(_Frozen):
+    """How usable the camera frame is, independent of what is in it.
+
+    Exists so that "we cannot see the candidate" is never silently scored
+    as "the candidate did something". A smeared lens, a dark room, or a
+    deliberately obscured camera all degrade every other signal in this
+    file, and a reviewer needs to know that the inputs were bad rather
+    than reading a low gaze confidence as evasion.
+
+    `sharpness` is a normalised variance-of-Laplacian: near 0.0 is a flat
+    or heavily blurred image, higher is more edge detail. It is not
+    calibrated to any physical unit and is only meaningful relative to the
+    threshold in the policy.
+    """
+
+    type: Literal["signal.frame_quality"] = "signal.frame_quality"
+    sharpness: float = Field(ge=0.0, le=1.0)
+    brightness: float = Field(ge=0.0, le=1.0)
+    face_covered: bool = False
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class LockdownEvent(StrEnum):
+    FULLSCREEN_EXIT = "fullscreen_exit"
+    RESTRICTED_KEY = "restricted_key"
+    CLIPBOARD = "clipboard"
+    CONTEXT_MENU = "context_menu"
+    TAB_SWITCH = "tab_switch"
+
+
+class LockdownSignal(_Frozen):
+    """A candidate action the exam shell blocked, and how many it has blocked.
+
+    Reported, never adjudicated, like everything else here. The client
+    counts locally so it can show the candidate an accurate warning
+    immediately, but `strike` is an observation the server re-derives from
+    the stream — see the `lockdown_strikes_exhausted` policy rule. A
+    client that under-reports its own strike count does not lower the
+    number the server arrives at.
+
+    `detail` carries the specific combination attempted (e.g. "Meta+C")
+    for the reviewer, not for matching on.
+    """
+
+    type: Literal["signal.lockdown"] = "signal.lockdown"
+    event: LockdownEvent
+    strike: int = Field(ge=0)
+    allowance: int = Field(ge=0)
+    detail: str | None = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
 # --------------------------------------------------------------------------
 # Non-signal payloads
 # --------------------------------------------------------------------------
@@ -193,6 +245,8 @@ Payload = Annotated[
     | LivenessSignal
     | AudioSignal
     | EnvironmentSignal
+    | FrameQualitySignal
+    | LockdownSignal
     | Heartbeat
     | Lifecycle
     | Attestation,

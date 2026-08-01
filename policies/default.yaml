@@ -198,6 +198,49 @@ rules:
     release_ms: 1000
     cooldown_ms: 30000
 
+  # -- Frame quality --------------------------------------------------------
+  # `soft`, and deliberately so. An unusable camera is overwhelmingly an
+  # equipment problem — a cheap webcam, a dim room, a smudged lens — and
+  # only rarely deliberate obstruction. This exists so a reviewer can tell
+  # "we could not see" apart from "they did something": without it, a
+  # blurred frame silently degrades gaze confidence and drops face
+  # detections, which reads exactly like a candidate turning away.
+  - id: camera_unusable
+    description: The camera image is too blurred or obscured to read a face from.
+    signal: signal.frame_quality
+    when: { field: sharpness, op: "<", value: 0.06 }
+    severity: soft
+    # 6s. Long, because a hand passing the lens, a moment of refocus, or
+    # someone leaning in all blur a frame or two, and none of that is worth
+    # telling a reviewer about.
+    onset_ms: 6000
+    release_ms: 2000
+    cooldown_ms: 60000
+
+  # -- Exam shell lockdown --------------------------------------------------
+  # Reported per attempt with the running count. The onset is 0 because
+  # unlike every other rule here there is nothing probabilistic to confirm:
+  # a keystroke either happened or it did not, and a "sustained" keypress
+  # is not a meaningful idea.
+  #
+  # The allowance lives in the rule threshold, not only in the client, so
+  # the server reaches its own conclusion about how many attempts occurred.
+  # A tampered client that reports `strike: 0` forever still emits one
+  # lockdown signal per attempt, and this rule counts the signals.
+  - id: lockdown_strikes_exhausted
+    description: >-
+      The candidate used all their warnings for blocked actions
+      (leaving fullscreen, copy/paste, developer tools).
+    signal: signal.lockdown
+    when: { field: strike, op: ">", value: 3 }
+    severity: hard
+    # See Rule.discrete: a keystroke is not a detector sample, so there is
+    # no confirmation window that would mean anything here.
+    discrete: true
+    onset_ms: 0
+    release_ms: 0
+    cooldown_ms: 15000
+
 # Absence-of-data rule. Evaluated on a wall-clock tick, not on receipt of an
 # event, so that a client which simply stops reporting still trips it.
 liveness:

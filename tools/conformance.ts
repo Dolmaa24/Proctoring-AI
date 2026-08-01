@@ -49,6 +49,21 @@ const payloads: Payload[] = [
     screen_share_active: true,
     confidence: 1,
   },
+  {
+    type: "signal.frame_quality",
+    sharpness: 0.0123456789,
+    brightness: 0.5,
+    face_covered: true,
+    confidence: 1,
+  },
+  {
+    type: "signal.lockdown",
+    event: "restricted_key",
+    strike: 2,
+    allowance: 3,
+    detail: "Meta+C — copy",
+    confidence: 1,
+  },
   { type: "heartbeat", frames_processed: 900, edge_fps: 29.97, dropped_frames: 3 },
   { type: "lifecycle", phase: "session_end", detail: "candidate finished — done" },
   {

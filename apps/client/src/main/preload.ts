@@ -43,6 +43,19 @@ contextBridge.exposeInMainWorld("proctor", {
    * more useful to an attacker than the camera access it already has.
    */
   getMediaJoin: (): Promise<MediaJoin | null> => ipcRenderer.invoke("proctor:media-join"),
+
+  /**
+   * Report that the candidate accepted the disclaimer.
+   *
+   * Deliberately not `observe({type: "lifecycle", phase: "exam_start"})`.
+   * Main rejects any payload from the renderer that is not a `signal.*`,
+   * and that rule is worth keeping: a renderer able to originate arbitrary
+   * lifecycle phases could claim `identity_verified` or `session_end` it
+   * has no standing to assert. So the renderer reports the one fact it
+   * actually witnessed — the button was pressed — and main decides what
+   * that means on the wire and tells the gateway.
+   */
+  grantConsent: (): Promise<boolean> => ipcRenderer.invoke("proctor:consent"),
 });
 
 declare global {
@@ -50,6 +63,7 @@ declare global {
     proctor: {
       observe(payload: Payload): Promise<boolean>;
       getMediaJoin(): Promise<MediaJoin | null>;
+      grantConsent(): Promise<boolean>;
     };
   }
 }

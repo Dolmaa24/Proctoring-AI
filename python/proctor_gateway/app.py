@@ -757,6 +757,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "url": settings.livekit_url or None,
         }
 
+    @app.post("/v1/sessions/{session_id}/consent")
+    async def record_consent(session_id: str) -> dict[str, Any]:
+        """The candidate accepted the disclaimer; start recording if enabled.
+
+        Recording starts here, server-side, rather than from the client
+        that just consented. The candidate's client has no console token
+        and cannot call the proctor recording endpoints — that boundary
+        stays intact (see `start_recording`). What it can do is report the
+        one fact it witnessed, and the server decides what follows.
+
+        Failing to start a recording does not fail the consent: the
+        candidate has agreed and the exam should proceed, with the
+        recording gap visible to a reviewer rather than a modal the
+        candidate cannot get past. The returned `recording` field says
+        plainly which happened.
+        """
+        if registry.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+
+        if not settings.media_enabled:
+            return {"consent": "recorded", "recording": None}
+
+        now = settings.clock()
+        try:
+            started = await asyncio.to_thread(media_provider.start_recording, session_id)
+        except RoomProviderError as exc:
+            log.warning("consent recorded for %s but recording failed: %s", session_id, exc)
+            return {"consent": "recorded", "recording": None, "error": str(exc)}
+
+        record = RecordingRecord(
+            recording_id=str(uuid.uuid4()),
+            session_id=session_id,
+            status=RecordingStatus.REQUESTED,
+            requested_ms=now,
+            egress_id=started.egress_id,
+        )
+        store.save_recording(record.as_dict(), now)
+        return {"consent": "recorded", "recording": record.as_dict()}
+
     @app.post("/v1/sessions/{session_id}/media/token")
     async def candidate_media_token(session_id: str) -> dict[str, Any]:
         """A publish-only token for the candidate's own room.

@@ -176,13 +176,36 @@ class Rule(BaseModel):
     action: AutomatedAction = AutomatedAction.FLAG
     requires_human_review: bool = True
 
+    discrete: bool = False
+    """This rule's signal reports a discrete event, not a detector sample.
+
+    The onset guard below exists because vision detectors produce noisy
+    single-frame false positives, and a HARD rule that fires on one frame
+    turns that noise into an accusation. That reasoning is specific to
+    *sampled probabilistic output* — gaze angles, face counts, object
+    detections — where "held for 800ms" is what separates signal from
+    noise.
+
+    It does not apply to an event that either happened or did not. A
+    keystroke is not a measurement with a confidence interval; there is no
+    "sustained Ctrl+C", and requiring one would mean the rule fires on the
+    second press rather than the first, or never. `signal.lockdown` is the
+    only signal in the shipped policy that qualifies.
+
+    Set this only when the signal is genuinely a discrete, deterministic
+    event reported by the client shell — never to get an inconvenient
+    detector rule past the guard. Doing that is precisely the mistake the
+    guard is here to prevent.
+    """
+
     @model_validator(mode="after")
     def _guard_instant_hard_rules(self) -> Rule:
-        if self.severity is Severity.HARD and self.onset_ms == 0:
+        if self.severity is Severity.HARD and self.onset_ms == 0 and not self.discrete:
             raise ValueError(
                 f"rule {self.id!r}: a HARD rule with onset_ms=0 fires on a single frame, "
                 "which makes it a detector false-positive amplifier. Use at least one "
-                "confirmation window (~500ms)."
+                "confirmation window (~500ms), or set discrete=true if this signal "
+                "reports a discrete event rather than a detector sample."
             )
         if self.action is AutomatedAction.LOCK_EXAM and not self.requires_human_review:
             raise ValueError(
