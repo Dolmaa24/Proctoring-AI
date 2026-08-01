@@ -23,6 +23,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,12 +51,113 @@ let consentAccepted = false;
 let gateway;
 let electron;
 
+// -- child process lifetime ---------------------------------------------
+//
+// Every spawned process is tracked, and every path out of this script —
+// success, exception, Ctrl-C, a closed stdout — goes through a kill.
+// Without that this script leaks: it used to `kill("SIGTERM")` the
+// gateway and call `process.exit` on the next line, and uvicorn's
+// graceful shutdown waits for open connections before exiting. The
+// parent was gone long before the child finished deciding whether to
+// die, leaving a uvicorn reparented to PID 1, still holding :8099, and
+// the next run failing against a stale gateway with the wrong token.
+
+const children = new Set();
+
+function track(proc) {
+  children.add(proc);
+  proc.once("exit", () => children.delete(proc));
+  return proc;
+}
+
+/**
+ * Signal a child *and everything it spawned*.
+ *
+ * The negative pid is the entire point. `node_modules/.bin/electron` is a
+ * Node launcher that spawns the real Electron binary as its own child, so
+ * signalling the pid we hold kills the launcher and leaves the app — plus
+ * its GPU, renderer, audio and video-capture helpers — running. Both
+ * children are spawned `detached`, which makes each a process-group
+ * leader, and `process.kill(-pid)` then reaches the whole group.
+ */
+function killTree(proc, signal) {
+  if (!proc?.pid) return;
+  try {
+    process.kill(-proc.pid, signal);
+  } catch {
+    // No process group (already reaped, or never became a leader). Fall
+    // back to the single pid rather than giving up on it.
+    try {
+      proc.kill(signal);
+    } catch {
+      // Already dead. Nothing to do.
+    }
+  }
+}
+
+/**
+ * Last-resort kill. Synchronous by necessity: `process.on("exit")` cannot
+ * await anything, so there is no grace period to offer here — SIGKILL is
+ * the only signal guaranteed to land before this process disappears.
+ */
+function killAllNow() {
+  for (const proc of children) killTree(proc, "SIGKILL");
+  children.clear();
+}
+
+/**
+ * Ask a child to stop, then insist.
+ *
+ * The escalation is not defensive padding. uvicorn treats SIGTERM as
+ * "finish serving open connections, then exit", and this run deliberately
+ * leaves websockets attached — so SIGTERM alone can hang indefinitely.
+ * Observed directly: orphaned gateways from earlier runs had stopped
+ * listening but were still alive, and only SIGKILL cleared them.
+ */
+async function terminate(proc, graceMs = 3_000) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+  killTree(proc, "SIGTERM");
+  const exited = await Promise.race([
+    once(proc, "exit").then(() => true),
+    delay(graceMs).then(() => false),
+  ]);
+  if (!exited) killTree(proc, "SIGKILL");
+}
+
+process.on("exit", killAllNow);
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => {
+    console.error(`\nreceived ${signal}; killing spawned processes`);
+    killAllNow();
+    process.exit(130);
+  });
+}
+
+for (const fault of ["uncaughtException", "unhandledRejection"]) {
+  process.on(fault, (error) => {
+    console.error(`e2e run failed (${fault}):`, error);
+    killAllNow();
+    process.exit(1);
+  });
+}
+
+// Piping this script into `head`/`grep -m1` closes stdout early, and the
+// next console.log raises EPIPE. That is a normal way to run it, and it
+// must not be a way to leak a gateway.
+process.stdout.on("error", (error) => {
+  if (error?.code === "EPIPE") {
+    killAllNow();
+    process.exit(0);
+  }
+});
+
 function note(kind) {
   observed.signals.set(kind, (observed.signals.get(kind) ?? 0) + 1);
 }
 
 async function startGateway() {
-  const proc = spawn(
+  const proc = track(spawn(
     path.join(repoRoot, ".venv", "bin", "uvicorn"),
     ["proctor_gateway.app:app", "--port", String(PORT), "--log-level", "warning"],
     {
@@ -67,8 +169,11 @@ async function startGateway() {
         PROCTOR_CONSOLE_TOKEN: CONSOLE_TOKEN,
       },
       stdio: ["ignore", "pipe", "pipe"],
+      // Own process group, so killTree can signal it and any child it
+      // spawns as a unit. See killTree.
+      detached: true,
     },
-  );
+  ));
   proc.stderr.on("data", (chunk) => {
     const text = chunk.toString();
     if (text.includes("Traceback")) process.stderr.write(`[gateway] ${text}`);
@@ -99,11 +204,10 @@ function watchProctor() {
     if (message.kind === "violation") observed.violations.push(message);
     if (message.session_id) observed.sessions.add(message.session_id);
   });
-  // An unhandled 'error' event crashes the whole Node process, skipping
-  // the try/catch below (it fires async, after that block has returned)
-  // and orphaning the spawned gateway subprocess to sit on this port
-  // forever. A rejected connection here is a bug to report, not a reason
-  // to leak a process.
+  // An unhandled 'error' event crashes the whole Node process — it fires
+  // async, after the try/catch below has returned. The cleanup handlers
+  // above now catch that case regardless, but a rejected connection is
+  // still a bug worth naming rather than a stack trace to decode.
   socket.on("error", (error) => {
     console.error("proctor stream connection failed:", error.message);
   });
@@ -143,11 +247,14 @@ function startElectron() {
     chromiumFlags.push(`--use-file-for-fake-video-capture=${path.resolve(clientRoot, VIDEO)}`);
   }
 
-  const proc = spawn(electronBinary, [clientRoot, ...chromiumFlags], {
-    cwd: clientRoot,
-    env: { ...process.env, PROCTOR_GATEWAY_URL: GATEWAY, PROCTOR_EXAM_ID: "e2e" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const proc = track(
+    spawn(electronBinary, [clientRoot, ...chromiumFlags], {
+      cwd: clientRoot,
+      env: { ...process.env, PROCTOR_GATEWAY_URL: GATEWAY, PROCTOR_EXAM_ID: "e2e" },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    }),
+  );
 
   const relay = (stream, label) =>
     stream.on("data", (chunk) => {
@@ -365,16 +472,16 @@ try {
   const status = await pollSession();
   collectSignalKinds(status);
 
-  electron.kill("SIGTERM");
-  await delay(1200);
+  await terminate(electron);
+  // Closed before the gateway is asked to stop, not after: uvicorn's
+  // graceful shutdown waits on open connections, and this socket is one.
   proctor.close();
 
   const ok = report(status);
-  gateway.kill("SIGTERM");
+  await terminate(gateway);
   process.exit(ok ? 0 : 1);
 } catch (error) {
   console.error("e2e run failed:", error);
-  electron?.kill("SIGKILL");
-  gateway?.kill("SIGKILL");
+  killAllNow();
   process.exit(1);
 }
